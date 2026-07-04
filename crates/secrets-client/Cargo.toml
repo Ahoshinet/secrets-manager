@@ -1,0 +1,14 @@
+[package]
+name = "secrets-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Secrets Manager client CLI (M2 — skeleton)"
+
+[[bin]]
+name = "secrets"
+path = "src/main.rs"
+
+[dependencies]

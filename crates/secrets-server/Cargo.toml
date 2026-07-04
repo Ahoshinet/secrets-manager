@@ -1,0 +1,37 @@
+[package]
+name = "secrets-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Secrets Manager server + admin CLI (axum + SQLite)"
+
+[[bin]]
+name = "secrets-server"
+path = "src/main.rs"
+
+[dependencies]
+secrets-crypto.workspace = true
+
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+rusqlite.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+secrecy.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+secrets-crypto.workspace = true
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
