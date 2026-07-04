@@ -34,7 +34,12 @@ fn setup() -> (Router, Db, TempDir) {
 
 fn add_token(db: &Db, name: &str, raw: &str, scope: Option<&str>) {
     let conn = db.lock().unwrap();
-    repo::insert_token(&conn, name, &hash_token(raw), scope).unwrap();
+    repo::insert_token(&conn, name, &hash_token(raw), scope, None).unwrap();
+}
+
+fn add_token_with_expiry(db: &Db, name: &str, raw: &str, expires_at: &str) {
+    let conn = db.lock().unwrap();
+    repo::insert_token(&conn, name, &hash_token(raw), None, Some(expires_at)).unwrap();
 }
 
 async fn send(
@@ -82,6 +87,30 @@ async fn invalid_token_is_401() {
     let (router, db, _tmp) = setup();
     add_token(&db, "dev", "real-token", None);
     let (status, _) = send(&router, "GET", "/v1/projects", Some("wrong-token"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn expired_token_is_401() {
+    let (router, db, _tmp) = setup();
+    add_token_with_expiry(&db, "dev", "tok-expired", "2000-01-01T00:00:00Z");
+    let (status, _) = send(&router, "GET", "/v1/projects", Some("tok-expired"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn unexpired_token_is_accepted() {
+    let (router, db, _tmp) = setup();
+    add_token_with_expiry(&db, "dev", "tok-live", "2999-01-01T00:00:00Z");
+    let (status, _) = send(&router, "GET", "/v1/projects", Some("tok-live"), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn token_with_garbage_expiry_fails_closed() {
+    let (router, db, _tmp) = setup();
+    add_token_with_expiry(&db, "dev", "tok-garbage", "not-a-timestamp");
+    let (status, _) = send(&router, "GET", "/v1/projects", Some("tok-garbage"), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 

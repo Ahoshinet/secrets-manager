@@ -138,6 +138,8 @@ pub struct TokenInfo {
     pub scope: Option<String>,
     pub created_at: String,
     pub revoked: bool,
+    /// RFC3339 expiry; `None` means the token never expires.
+    pub expires_at: Option<String>,
 }
 
 /// The authenticated identity resolved from a bearer token.
@@ -152,11 +154,12 @@ pub fn insert_token(
     name: &str,
     token_hash: &[u8],
     scope: Option<&str>,
+    expires_at: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO tokens(name, token_hash, project_scope, created_at, revoked)
-         VALUES(?1, ?2, ?3, ?4, 0)",
-        params![name, token_hash, scope, now_rfc3339()],
+        "INSERT INTO tokens(name, token_hash, project_scope, created_at, revoked, expires_at)
+         VALUES(?1, ?2, ?3, ?4, 0, ?5)",
+        params![name, token_hash, scope, now_rfc3339(), expires_at],
     )?;
     Ok(())
 }
@@ -164,7 +167,8 @@ pub fn insert_token(
 pub fn list_tokens(conn: &Connection) -> rusqlite::Result<Vec<TokenInfo>> {
     // Note: token_hash is intentionally never selected/exposed.
     let mut stmt = conn.prepare(
-        "SELECT name, project_scope, created_at, revoked FROM tokens ORDER BY created_at",
+        "SELECT name, project_scope, created_at, revoked, expires_at
+         FROM tokens ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(TokenInfo {
@@ -172,6 +176,7 @@ pub fn list_tokens(conn: &Connection) -> rusqlite::Result<Vec<TokenInfo>> {
             scope: r.get(1)?,
             created_at: r.get(2)?,
             revoked: r.get::<_, i64>(3)? != 0,
+            expires_at: r.get(4)?,
         })
     })?;
     rows.collect()
@@ -196,19 +201,30 @@ pub fn authenticate(
     presented_hash: &[u8],
 ) -> rusqlite::Result<Option<AuthedToken>> {
     let mut stmt = conn.prepare(
-        "SELECT name, token_hash, project_scope FROM tokens WHERE revoked = 0",
+        "SELECT name, token_hash, project_scope, expires_at FROM tokens WHERE revoked = 0",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
 
+    let now = time::OffsetDateTime::now_utc();
     let mut found: Option<AuthedToken> = None;
     for row in rows {
-        let (name, hash, scope) = row?;
+        let (name, hash, scope, expires_at) = row?;
+        // Expiry check fails closed: unparseable timestamps count as expired.
+        // (Expiry status is not secret, so skipping here leaks no timing.)
+        if let Some(exp) = &expires_at {
+            match time::OffsetDateTime::parse(exp, &time::format_description::well_known::Rfc3339)
+            {
+                Ok(t) if t > now => {}
+                _ => continue,
+            }
+        }
         // Do not early-return on match: keep the loop shape uniform.
         if ct_eq(&hash, presented_hash) {
             found = Some(AuthedToken { name, scope });

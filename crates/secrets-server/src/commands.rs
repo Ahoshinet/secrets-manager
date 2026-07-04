@@ -46,6 +46,12 @@ enum TokenCmd {
         /// Restrict the token to a single project (omit for all projects).
         #[arg(long)]
         project: Option<String>,
+        /// Days until the token expires.
+        #[arg(long, default_value_t = 90, conflicts_with = "no_expiry")]
+        ttl_days: u32,
+        /// Issue a token that never expires (requires manual revocation).
+        #[arg(long)]
+        no_expiry: bool,
     },
     /// Revoke all active tokens with the given name.
     Revoke {
@@ -62,7 +68,16 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Serve => serve(),
         Command::Token { cmd } => match cmd {
-            TokenCmd::Create { name, project } => token_create(&name, project.as_deref()),
+            TokenCmd::Create {
+                name,
+                project,
+                ttl_days,
+                no_expiry,
+            } => token_create(
+                &name,
+                project.as_deref(),
+                (!no_expiry).then_some(ttl_days),
+            ),
             TokenCmd::Revoke { name } => token_revoke(&name),
             TokenCmd::List => token_list(),
         },
@@ -126,7 +141,7 @@ async fn shutdown_signal() {
     eprintln!("[info] shutting down");
 }
 
-fn token_create(name: &str, project: Option<&str>) -> Result<()> {
+fn token_create(name: &str, project: Option<&str>, ttl_days: Option<u32>) -> Result<()> {
     if !valid_name(name) {
         bail!("invalid token name (allowed: alphanumeric, '-', '_')");
     }
@@ -135,19 +150,34 @@ fn token_create(name: &str, project: Option<&str>) -> Result<()> {
             bail!("invalid project scope name");
         }
     }
+    if ttl_days == Some(0) {
+        bail!("--ttl-days must be at least 1 (or use --no-expiry)");
+    }
+
+    let expires_at = ttl_days
+        .map(|days| {
+            (time::OffsetDateTime::now_utc() + time::Duration::days(i64::from(days)))
+                .format(&time::format_description::well_known::Rfc3339)
+                .context("failed to format expiry timestamp")
+        })
+        .transpose()?;
 
     let cfg = Config::from_env()?;
     let conn = db::open(&cfg.db_path)?;
 
     let token = generate_token();
     let hash = hash_token(token.expose_secret());
-    repo::insert_token(&conn, name, &hash, project)?;
+    repo::insert_token(&conn, name, &hash, project, expires_at.as_deref())?;
 
     // Printed exactly once, to stdout. Never logged or stored in plaintext.
     println!("Token created (name: {name}).");
     match project {
         Some(p) => println!("Scope: project '{p}'"),
         None => println!("Scope: all projects"),
+    }
+    match &expires_at {
+        Some(exp) => println!("Expires: {exp}"),
+        None => println!("Expires: never (revoke manually when no longer needed)"),
     }
     println!("Store it now — it is shown only once:");
     println!("{}", token.expose_secret());
@@ -171,15 +201,16 @@ fn token_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:<16} {:<26} REVOKED",
-        "NAME", "SCOPE", "CREATED"
+        "{:<20} {:<16} {:<26} {:<26} REVOKED",
+        "NAME", "SCOPE", "CREATED", "EXPIRES"
     );
     for t in tokens {
         println!(
-            "{:<20} {:<16} {:<26} {}",
+            "{:<20} {:<16} {:<26} {:<26} {}",
             t.name,
             t.scope.as_deref().unwrap_or("(all)"),
             t.created_at,
+            t.expires_at.as_deref().unwrap_or("(never)"),
             if t.revoked { "yes" } else { "no" }
         );
     }
