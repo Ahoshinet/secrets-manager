@@ -1,15 +1,17 @@
 //! Append-only JSON Lines audit log.
 //!
 //! Records who did what, never *what the secret was*. Only the token
-//! **name** (not the token), method, path, and status are written.
+//! **name** (not the token), method, matched route template, project
+//! name, and status are written. Raw request paths are never logged:
+//! they can contain secret key names or attacker-chosen segments.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
-use axum::extract::{Request, State};
+use anyhow::{bail, Context, Result};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -28,7 +30,12 @@ struct Entry<'a> {
     /// Token *name* only. `None` when the request was unauthenticated.
     token: Option<&'a str>,
     method: &'a str,
+    /// Matched route template (e.g. `/v1/projects/:name/secrets/:key`),
+    /// or `(unmatched)` for requests that hit no route. Never the raw path.
     path: &'a str,
+    /// Project name extracted from the path for project-scoped routes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a str>,
     status: u16,
 }
 
@@ -44,8 +51,13 @@ impl AuditLog {
         }
         let file = audit_open_options()
             .open(path)
-            .with_context(|| format!("failed to open audit log at {}", path.display()))?;
-        set_private_permissions(path)?;
+            .with_context(|| {
+                format!(
+                    "failed to open audit log at {} (must not be a symlink)",
+                    path.display()
+                )
+            })?;
+        ensure_private(&file, path)?;
         Ok(AuditLog {
             file: Mutex::new(file),
         })
@@ -53,12 +65,20 @@ impl AuditLog {
 
     /// Append one audit record. Failures are reported to stderr but never
     /// abort request handling.
-    pub fn record(&self, method: &Method, path: &str, token: Option<&str>, status: u16) {
+    pub fn record(
+        &self,
+        method: &Method,
+        path: &str,
+        project: Option<&str>,
+        token: Option<&str>,
+        status: u16,
+    ) {
         let entry = Entry {
             ts: crate::repo::now_rfc3339(),
             token,
             method: method.as_str(),
             path,
+            project,
             status,
         };
 
@@ -83,7 +103,10 @@ impl AuditLog {
 fn audit_open_options() -> OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     let mut opts = OpenOptions::new();
-    opts.create(true).append(true).mode(0o600);
+    opts.create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
     opts
 }
 
@@ -94,38 +117,85 @@ fn audit_open_options() -> OpenOptions {
     opts
 }
 
+/// Validate and fix up the *opened* file: fd-based, so it cannot be raced
+/// against the open (no TOCTOU window).
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
+fn ensure_private(file: &File, path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat audit log at {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("audit log {} is not a regular file", path.display());
+    }
+    let mut permissions = meta.permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)
+            .with_context(|| format!("failed to chmod audit log at {}", path.display()))?;
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
+fn ensure_private(file: &File, path: &Path) -> Result<()> {
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat audit log at {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("audit log {} is not a regular file", path.display());
+    }
     Ok(())
 }
 
 /// Middleware that records every request after it completes.
 ///
 /// The token *name* is resolved independently for logging; this never
-/// logs the token itself, nor any request/response body.
+/// logs the token itself, nor any request/response body. The logged path
+/// is the matched route *template* — never the raw URI, which can contain
+/// secret key names or attacker-chosen segments. The project name is
+/// logged separately for project-scoped routes.
 pub async fn audit_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let matched = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let project = match &matched {
+        Some(t) if t.starts_with("/v1/projects/:name") => request
+            .uri()
+            .path()
+            .split('/')
+            .nth(3)
+            .map(truncate_for_log),
+        _ => None,
+    };
     let token_name = auth::resolve_token_name(&state, request.headers());
 
     let response = next.run(request).await;
 
-    state
-        .audit
-        .record(&method, &path, token_name.as_deref(), response.status().as_u16());
+    state.audit.record(
+        &method,
+        matched.as_deref().unwrap_or("(unmatched)"),
+        project.as_deref(),
+        token_name.as_deref(),
+        response.status().as_u16(),
+    );
 
     response
+}
+
+/// Cap a path segment destined for the log. Valid project names are at
+/// most 64 bytes; longer (hence invalid) segments are truncated so a
+/// hostile request cannot bloat the audit log.
+fn truncate_for_log(segment: &str) -> String {
+    let mut end = segment.len().min(64);
+    while !segment.is_char_boundary(end) {
+        end -= 1;
+    }
+    segment[..end].to_string()
 }

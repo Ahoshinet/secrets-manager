@@ -15,6 +15,7 @@ pub enum AppError {
     NotFound,
     BadRequest(&'static str),
     Conflict(&'static str),
+    PayloadTooLarge,
     /// Something failed server-side. The `&'static str` is a non-secret
     /// context tag logged to stderr; the client only sees a generic msg.
     Internal(&'static str),
@@ -28,6 +29,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+            AppError::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large"),
             AppError::Internal(tag) => {
                 // Fixed tag only — no secret material.
                 eprintln!("[error] internal: {tag}");

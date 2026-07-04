@@ -1,5 +1,7 @@
 //! Secrets Manager client CLI entrypoint.
 
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 use anyhow::Result;

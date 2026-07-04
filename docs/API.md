@@ -10,14 +10,19 @@ track it.
 
 - The server binds **loopback only** and speaks plain HTTP; TLS is terminated by
   a reverse proxy in front of it. Clients therefore require an `https://` server
-  URL (they refuse plain `http://`).
+  URL. Plain `http://` is accepted **only for loopback hosts** (`127.0.0.0/8`,
+  `::1`, `localhost`) to support same-host use; any other `http://` URL is
+  refused. Base URLs must not contain userinfo, query, or fragment parts.
 - Every endpoint **except `GET /v1/health`** requires a bearer token:
   `Authorization: Bearer <token>`.
 - A token may be **scoped** to a single project. A scoped token accessing any
   other project receives `403`. `GET /v1/projects` returns only the scoped
   project for such tokens.
 - Request and response bodies are JSON (`Content-Type: application/json`).
-  Bodies are size-limited by the server; clients cap response reads at 1 MiB.
+  The server caps request bodies at **1 MiB** (larger is `413`); clients cap
+  response reads at 1 MiB.
+- Tokens can carry an expiry (90-day default at creation). Expired tokens
+  receive `401`, exactly like revoked ones.
 
 ## Validation rules
 
@@ -35,11 +40,15 @@ Violations return `400`.
 | 200 | OK (body follows) |
 | 201 | Created (project) |
 | 204 | No Content (delete) |
-| 400 | Bad Request (invalid project/key name or body) |
-| 401 | Unauthorized (missing/invalid/revoked token) |
+| 400 | Bad Request (invalid project/key name, malformed/invalid JSON body) |
+| 401 | Unauthorized (missing/invalid/revoked/expired token) |
 | 403 | Forbidden (token not scoped to this project) |
-| 404 | Not Found (unknown project or key) |
+| 404 | Not Found (unknown project or key; the name itself was valid) |
 | 409 | Conflict (project already exists) |
+| 413 | Payload Too Large (request body over 1 MiB) |
+
+Name validation runs **before** existence checks: a syntactically invalid
+project or key name is always `400`, never `404`.
 
 No error response ever includes secret material, token values, or the master
 passphrase.

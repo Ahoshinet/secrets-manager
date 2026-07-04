@@ -318,4 +318,57 @@ async fn audit_logs_token_name_but_not_token_or_secret_value() {
     assert!(audit.contains("dev-token-name"));
     assert!(!audit.contains("raw-token-value"));
     assert!(!audit.contains(secret_value));
+    // The raw path (with the secret key name) must not be logged; only the
+    // route template and the project name are.
+    assert!(!audit.contains("DATABASE_URL"));
+    assert!(audit.contains("/v1/projects/:name/secrets/:key"));
+    assert!(audit.contains(r#""project":"cdn""#));
+}
+
+#[tokio::test]
+async fn invalid_project_name_is_400_not_404() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "tok", "raw", None);
+
+    // '!' is outside the allowed project-name alphabet.
+    let (status, _) = send(&router, "GET", "/v1/projects/bad%21name/secrets", Some("raw"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(
+        &router,
+        "DELETE",
+        "/v1/projects/bad%21name/secrets/KEY",
+        Some("raw"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn malformed_json_is_400() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "tok", "raw", None);
+
+    let (status, _) = send(&router, "POST", "/v1/projects", Some("raw"), Some("{not json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn oversized_body_is_413() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "tok", "raw", None);
+    let (status, _) = send(&router, "POST", "/v1/projects", Some("raw"), Some(r#"{"name":"cdn"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let big = format!(r#"{{"value":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
+    let (status, _) = send(
+        &router,
+        "PUT",
+        "/v1/projects/cdn/secrets/BIG",
+        Some("raw"),
+        Some(&big),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }

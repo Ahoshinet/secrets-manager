@@ -89,10 +89,14 @@ do not declare dynamic dependencies.
 
 ## Server usage
 
-The server takes its master passphrase from `SECRETS_PASSPHRASE`,
-`SECRETS_PASSPHRASE_FILE`, systemd `LoadCredential=secrets-passphrase`, or, if
-attached to a TTY, an interactive prompt. Passphrase files must be private on
-Unix (no group/other permissions); a single trailing newline is ignored.
+The server takes its master passphrase from (in this order)
+`SECRETS_PASSPHRASE`, `SECRETS_PASSPHRASE_FILE`, systemd
+`LoadCredential=secrets-passphrase`, or, if attached to a TTY, an interactive
+prompt. **Prefer a passphrase file, the systemd credential, or the interactive
+prompt** — an inline `SECRETS_PASSPHRASE=...` on the command line lands in
+shell history and is visible in the process environment. Passphrase files must
+be private on Unix (no group/other permissions) and must not be symlinks; a
+single trailing newline is ignored.
 
 Environment variables:
 
@@ -105,14 +109,21 @@ Environment variables:
 | `SECRETS_BIND` | `127.0.0.1:8787` | listen address (keep loopback) |
 
 ```bash
+# Point the server at a private passphrase file (0600, not a symlink).
+export SECRETS_PASSPHRASE_FILE=/etc/secrets-manager/master-passphrase
+
 # Issue a token (printed once, never stored in plaintext).
-SECRETS_PASSPHRASE=... secrets-server token create --name macbook --project cdn
+# Tokens expire after 90 days by default; use --ttl-days N to adjust or
+# --no-expiry for a token you will revoke manually.
+secrets-server token create --name macbook --project cdn
 secrets-server token list
 secrets-server token revoke --name macbook
+
+# Rekey requires exclusive access: stop the server first.
 secrets-server rekey
 
-# Run the server.
-SECRETS_PASSPHRASE=... secrets-server serve
+# Run the server (holds an exclusive lock on the DB while running).
+secrets-server serve
 ```
 
 ## Deployment

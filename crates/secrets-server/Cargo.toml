@@ -30,6 +30,9 @@ thiserror.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 secrets-crypto.workspace = true
 tempfile.workspace = true

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -38,6 +39,17 @@ fn valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
+/// Map a JSON extraction failure to the documented contract: `413` when
+/// the body exceeded the size limit, `400` for everything else
+/// (malformed JSON, wrong content type, missing fields).
+fn map_json_rejection(rejection: JsonRejection) -> AppError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge
+    } else {
+        AppError::BadRequest("invalid JSON body")
+    }
+}
+
 /// Unauthenticated liveness probe.
 pub async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
@@ -51,8 +63,9 @@ pub struct CreateProjectBody {
 pub async fn create_project(
     State(state): State<AppState>,
     token: AuthedToken,
-    Json(body): Json<CreateProjectBody>,
+    body: Result<Json<CreateProjectBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
+    let Json(body) = body.map_err(map_json_rejection)?;
     if !valid_project(&body.name) {
         return Err(AppError::BadRequest("invalid project name"));
     }
@@ -87,11 +100,17 @@ pub async fn list_projects(
     Ok(Json(json!({ "projects": names })))
 }
 
+/// Note on memory hygiene: the decrypted values necessarily traverse the
+/// JSON serializer and HTTP stack as plain heap data; those copies are
+/// outside our control and are not zeroized. See docs/SECURITY.md.
 pub async fn get_secrets(
     State(state): State<AppState>,
     token: AuthedToken,
     Path(name): Path<String>,
 ) -> Result<Json<BTreeMap<String, String>>, AppError> {
+    if !valid_project(&name) {
+        return Err(AppError::BadRequest("invalid project name"));
+    }
     ensure_scope(&token, &name)?;
 
     let conn = state.db.lock().map_err(|_| AppError::Internal("db lock"))?;
@@ -120,8 +139,13 @@ pub async fn put_secret(
     State(state): State<AppState>,
     token: AuthedToken,
     Path((name, key)): Path<(String, String)>,
-    Json(mut body): Json<SetSecretBody>,
+    body: Result<Json<SetSecretBody>, JsonRejection>,
 ) -> Result<Json<Value>, AppError> {
+    let Json(mut body) = body.map_err(map_json_rejection)?;
+    if !valid_project(&name) {
+        body.value.zeroize();
+        return Err(AppError::BadRequest("invalid project name"));
+    }
     ensure_scope(&token, &name)?;
     if !valid_key(&key) {
         body.value.zeroize();
@@ -148,6 +172,12 @@ pub async fn delete_secret(
     token: AuthedToken,
     Path((name, key)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
+    if !valid_project(&name) {
+        return Err(AppError::BadRequest("invalid project name"));
+    }
+    if !valid_key(&key) {
+        return Err(AppError::BadRequest("invalid key name"));
+    }
     ensure_scope(&token, &name)?;
 
     let conn = state.db.lock().map_err(|_| AppError::Internal("db lock"))?;

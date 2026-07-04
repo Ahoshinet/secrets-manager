@@ -99,9 +99,15 @@ fn systemd_credential_path(name: &str) -> Option<PathBuf> {
 }
 
 fn read_passphrase_file(path: &Path, source: &str) -> Result<SecretString> {
-    validate_passphrase_file_permissions(path)?;
+    use std::io::Read as _;
 
-    let mut passphrase = fs::read_to_string(path)
+    // Open first, then validate the opened fd's metadata: the symlink and
+    // permission checks cannot be raced against the read (no TOCTOU).
+    let mut file = open_passphrase_file(path)
+        .with_context(|| format!("failed to open {source} passphrase file {}", path.display()))?;
+
+    let mut passphrase = String::new();
+    file.read_to_string(&mut passphrase)
         .with_context(|| format!("failed to read {source} passphrase file {}", path.display()))?;
     strip_single_trailing_newline(&mut passphrase);
 
@@ -112,6 +118,36 @@ fn read_passphrase_file(path: &Path, source: &str) -> Result<SecretString> {
     Ok(SecretString::from(passphrase))
 }
 
+#[cfg(unix)]
+fn open_passphrase_file(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("open failed (note: the passphrase file must not be a symlink)")?;
+
+    let meta = file.metadata().context("failed to stat passphrase file")?;
+    if !meta.is_file() {
+        bail!("passphrase file must be a regular file");
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        bail!("passphrase file must not be readable, writable, or executable by group/others");
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_passphrase_file(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .context("open failed")
+}
+
 fn strip_single_trailing_newline(s: &mut String) {
     if s.ends_with('\n') {
         s.pop();
@@ -119,32 +155,6 @@ fn strip_single_trailing_newline(s: &mut String) {
             s.pop();
         }
     }
-}
-
-#[cfg(unix)]
-fn validate_passphrase_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect passphrase file {}", path.display()))?;
-    if meta.file_type().is_symlink() {
-        bail!("passphrase file {} must not be a symlink", path.display());
-    }
-
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        bail!(
-            "passphrase file {} must not be readable, writable, or executable by group/others",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_passphrase_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -185,7 +195,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
         let err = read_passphrase_file(&path, "test").unwrap_err();
-        assert!(err.to_string().contains("group/others"));
+        assert!(format!("{err:#}").contains("group/others"));
     }
 
     #[cfg(unix)]

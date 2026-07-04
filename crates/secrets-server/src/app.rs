@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, put};
 use axum::Router;
@@ -34,6 +35,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/:name/secrets/:key",
             put(handlers::put_secret).delete(handlers::delete_secret),
         )
+        // Documented API contract: request bodies are capped at 1 MiB
+        // (matches the clients' response-read cap). Exceeding it is 413.
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             audit::audit_middleware,
