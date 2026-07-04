@@ -11,14 +11,23 @@ use secrets_client::{commands, config};
 
 fn dispatch(cli: Cli) -> Result<i32> {
     let cfg = config::load()?;
-    let api = Api::new(&cfg);
+    let no_cache = cli.command.no_cache();
+    let api = if no_cache {
+        Api::new_no_cache(&cfg)
+    } else {
+        Api::new(&cfg)
+    };
 
     match cli.command {
-        Command::Run { project, command } => commands::run(&api, &project, &command),
-        Command::Get { project, key } => commands::get(&api, &project, &key),
+        Command::Run {
+            project, command, ..
+        } => commands::run(&api, &project, &command),
+        Command::Get { project, key, .. } => commands::get(&api, &project, &key),
         Command::Set { project, key } => commands::set(&api, &project, &key),
-        Command::List { project } => commands::list(&api, &project),
-        Command::Export { project, format } => commands::export(&api, &project, &format),
+        Command::List { project, .. } => commands::list(&api, &project),
+        Command::Export {
+            project, format, ..
+        } => commands::export(&api, &project, &format),
     }
 }
 

@@ -258,3 +258,35 @@ async fn invalid_names_are_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn audit_logs_token_name_but_not_token_or_secret_value() {
+    let (router, db, tmp) = setup();
+    add_token(&db, "dev-token-name", "raw-token-value", None);
+
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("raw-token-value"),
+        Some(r#"{"name":"cdn"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let secret_value = "postgres://user:pass@host/db";
+    let (status, _) = send(
+        &router,
+        "PUT",
+        "/v1/projects/cdn/secrets/DATABASE_URL",
+        Some("raw-token-value"),
+        Some(&format!(r#"{{"value":"{secret_value}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let audit = std::fs::read_to_string(tmp.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("dev-token-name"));
+    assert!(!audit.contains("raw-token-value"));
+    assert!(!audit.contains(secret_value));
+}

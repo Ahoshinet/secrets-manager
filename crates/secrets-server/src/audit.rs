@@ -34,11 +34,18 @@ struct Entry<'a> {
 
 impl AuditLog {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create audit log directory at {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = audit_open_options()
             .open(path)
             .with_context(|| format!("failed to open audit log at {}", path.display()))?;
+        set_private_permissions(path)?;
         Ok(AuditLog {
             file: Mutex::new(file),
         })
@@ -70,6 +77,35 @@ impl AuditLog {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn audit_open_options() -> OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true).mode(0o600);
+    opts
+}
+
+#[cfg(not(unix))]
+fn audit_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    opts
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Middleware that records every request after it completes.

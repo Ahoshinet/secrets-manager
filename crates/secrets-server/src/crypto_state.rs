@@ -6,9 +6,12 @@
 //! wrong passphrase fails loudly instead of silently corrupting data.
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::Connection;
-use secrecy::SecretString;
-use secrets_crypto::{aad_bytes, decrypt, derive_key, encrypt, generate_salt, KdfParams, MasterKey};
+use rusqlite::{params, Connection};
+use secrecy::{ExposeSecret, SecretString};
+use secrets_crypto::{
+    aad_bytes, decrypt, derive_key, encrypt, generate_salt, KdfParams, MasterKey,
+};
+use zeroize::Zeroize;
 
 use crate::repo;
 
@@ -47,13 +50,102 @@ pub fn init_or_verify(conn: &Connection, passphrase: &SecretString) -> Result<Ma
     }
 }
 
+/// Verify the current passphrase and re-encrypt every secret under a new
+/// passphrase-derived key. The verifier and all KDF metadata are updated in
+/// the same transaction as the secret ciphertexts.
+pub fn rekey(
+    conn: &Connection,
+    current_passphrase: &SecretString,
+    new_passphrase: &SecretString,
+) -> Result<usize> {
+    rekey_with_params(conn, current_passphrase, new_passphrase, KdfParams::STRONG)
+}
+
+fn rekey_with_params(
+    conn: &Connection,
+    current_passphrase: &SecretString,
+    new_passphrase: &SecretString,
+    new_params: KdfParams,
+) -> Result<usize> {
+    if current_passphrase.expose_secret() == new_passphrase.expose_secret() {
+        bail!("new passphrase must differ from the current passphrase");
+    }
+
+    let old_key = match repo::get_meta(conn, K_SALT).context("reading kdf salt")? {
+        Some(salt) => verify(conn, current_passphrase, &salt)?,
+        None => bail!("cannot rekey an uninitialized database"),
+    };
+
+    let new_salt = generate_salt();
+    let new_key = derive_key(new_passphrase, &new_salt, new_params).map_err(|e| anyhow!(e))?;
+
+    struct Row {
+        id: i64,
+        project: String,
+        key: String,
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT secrets.id, projects.name, secrets.key, secrets.nonce, secrets.ciphertext
+             FROM secrets
+             JOIN projects ON projects.id = secrets.project_id
+             ORDER BY secrets.id",
+        )?;
+        let iter = stmt.query_map([], |r| {
+            Ok(Row {
+                id: r.get(0)?,
+                project: r.get(1)?,
+                key: r.get(2)?,
+                nonce: r.get(3)?,
+                ciphertext: r.get(4)?,
+            })
+        })?;
+        iter.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let count = rows.len();
+    for row in rows {
+        let aad = aad_bytes(&row.project, &row.key);
+        let mut plaintext = decrypt(&old_key, &row.nonce, &row.ciphertext, &aad)
+            .map_err(|_| anyhow!("failed to decrypt existing secret during rekey"))?;
+        let (new_nonce, new_ct) = encrypt(&new_key, &plaintext, &aad).map_err(|e| anyhow!(e))?;
+        plaintext.zeroize();
+        tx.execute(
+            "UPDATE secrets SET nonce = ?1, ciphertext = ?2 WHERE id = ?3",
+            params![new_nonce, new_ct, row.id],
+        )?;
+    }
+
+    let (verifier_nonce, verifier_ct) =
+        encrypt(&new_key, SENTINEL, &verifier_aad()).map_err(|e| anyhow!(e))?;
+    repo::set_meta(&tx, K_SALT, &new_salt)?;
+    repo::set_meta(&tx, K_M, &u32_to_le(new_params.m_cost_kib))?;
+    repo::set_meta(&tx, K_T, &u32_to_le(new_params.t_cost))?;
+    repo::set_meta(&tx, K_P, &u32_to_le(new_params.p_cost))?;
+    repo::set_meta(&tx, K_VNONCE, &verifier_nonce)?;
+    repo::set_meta(&tx, K_VCT, &verifier_ct)?;
+    tx.commit()?;
+
+    Ok(count)
+}
+
 fn initialize(conn: &Connection, passphrase: &SecretString) -> Result<MasterKey> {
+    initialize_with_params(conn, passphrase, KdfParams::STRONG)
+}
+
+fn initialize_with_params(
+    conn: &Connection,
+    passphrase: &SecretString,
+    params: KdfParams,
+) -> Result<MasterKey> {
     let salt = generate_salt();
-    let params = KdfParams::STRONG;
     let key = derive_key(passphrase, &salt, params).map_err(|e| anyhow!(e))?;
 
-    let (nonce, ct) =
-        encrypt(&key, SENTINEL, &verifier_aad()).map_err(|e| anyhow!(e))?;
+    let (nonce, ct) = encrypt(&key, SENTINEL, &verifier_aad()).map_err(|e| anyhow!(e))?;
 
     // Persist all crypto metadata atomically.
     let tx = conn.unchecked_transaction()?;
@@ -95,5 +187,49 @@ fn get_required(conn: &Connection, key: &str) -> Result<Vec<u8>> {
     match repo::get_meta(conn, key)? {
         Some(v) => Ok(v),
         None => bail!("database is missing required crypto metadata ({key})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn cheap_params() -> KdfParams {
+        KdfParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    #[test]
+    fn rekey_reencrypts_existing_secrets_and_updates_verifier() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+
+        let old_pass = SecretString::from("old-passphrase".to_string());
+        let new_pass = SecretString::from("new-passphrase".to_string());
+        let old_key = initialize_with_params(&conn, &old_pass, cheap_params()).unwrap();
+
+        repo::create_project(&conn, "cdn").unwrap();
+        let pid = repo::project_id(&conn, "cdn").unwrap().unwrap();
+        let aad = aad_bytes("cdn", "DATABASE_URL");
+        let (nonce, ciphertext) = encrypt(&old_key, b"postgres://secret", &aad).unwrap();
+        repo::upsert_secret(&conn, pid, "DATABASE_URL", &nonce, &ciphertext).unwrap();
+
+        let changed = rekey_with_params(&conn, &old_pass, &new_pass, cheap_params()).unwrap();
+        assert_eq!(changed, 1);
+
+        let salt = repo::get_meta(&conn, K_SALT).unwrap().unwrap();
+        assert!(verify(&conn, &old_pass, &salt).is_err());
+        let new_key = verify(&conn, &new_pass, &salt).unwrap();
+
+        let rows = repo::list_secret_rows(&conn, pid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].nonce, nonce);
+        assert_ne!(rows[0].ciphertext, ciphertext);
+        let plaintext = decrypt(&new_key, &rows[0].nonce, &rows[0].ciphertext, &aad).unwrap();
+        assert_eq!(plaintext, b"postgres://secret");
     }
 }

@@ -21,6 +21,9 @@ pub enum Command {
     Run {
         #[arg(long)]
         project: String,
+        /// Disable offline cache reads/writes for this invocation.
+        #[arg(long)]
+        no_cache: bool,
         /// The command to execute, given after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -29,6 +32,9 @@ pub enum Command {
     Get {
         #[arg(long)]
         project: String,
+        /// Disable offline cache reads/writes for this invocation.
+        #[arg(long)]
+        no_cache: bool,
         key: String,
     },
     /// Set a secret. The value is read from stdin or an interactive
@@ -42,12 +48,30 @@ pub enum Command {
     List {
         #[arg(long)]
         project: String,
+        /// Disable offline cache reads/writes for this invocation.
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Print secrets in dotenv format to stdout (explicit opt-in).
     Export {
         #[arg(long)]
         project: String,
+        /// Disable offline cache reads/writes for this invocation.
+        #[arg(long)]
+        no_cache: bool,
         #[arg(long, default_value = "dotenv")]
         format: String,
     },
+}
+
+impl Command {
+    pub fn no_cache(&self) -> bool {
+        match self {
+            Command::Run { no_cache, .. }
+            | Command::Get { no_cache, .. }
+            | Command::List { no_cache, .. }
+            | Command::Export { no_cache, .. } => *no_cache,
+            Command::Set { .. } => false,
+        }
+    }
 }

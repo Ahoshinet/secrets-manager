@@ -1,10 +1,11 @@
 //! CLI command definitions and their implementations.
 
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use secrets_crypto::{generate_token, hash_token};
 
 use crate::app::{self, AppState};
@@ -32,6 +33,8 @@ enum Command {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Change the master passphrase and re-encrypt every stored secret.
+    Rekey,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +66,7 @@ pub fn run() -> Result<()> {
             TokenCmd::Revoke { name } => token_revoke(&name),
             TokenCmd::List => token_list(),
         },
+        Command::Rekey => rekey(),
     }
 }
 
@@ -172,4 +176,48 @@ fn token_list() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn rekey() -> Result<()> {
+    let cfg = Config::from_env()?;
+    let current = acquire_passphrase()?;
+    let new_passphrase = acquire_new_passphrase(&current)?;
+
+    let conn = db::open(&cfg.db_path)?;
+    let count = crypto_state::rekey(&conn, &current, &new_passphrase)?;
+    println!("Re-encrypted {count} secret(s) with a new master passphrase.");
+    Ok(())
+}
+
+fn acquire_new_passphrase(current: &SecretString) -> Result<SecretString> {
+    if let Ok(p) = std::env::var("SECRETS_NEW_PASSPHRASE") {
+        if p.is_empty() {
+            bail!("SECRETS_NEW_PASSPHRASE is set but empty");
+        }
+        if p == current.expose_secret() {
+            bail!("new passphrase must differ from the current passphrase");
+        }
+        return Ok(SecretString::from(p));
+    }
+
+    if std::io::stdin().is_terminal() {
+        let first = rpassword::prompt_password("New master passphrase: ")
+            .context("failed to read new passphrase from terminal")?;
+        if first.is_empty() {
+            bail!("new passphrase must not be empty");
+        }
+        let second = rpassword::prompt_password("Confirm new master passphrase: ")
+            .context("failed to read passphrase confirmation from terminal")?;
+        if first != second {
+            bail!("new passphrase confirmation did not match");
+        }
+        if first == current.expose_secret() {
+            bail!("new passphrase must differ from the current passphrase");
+        }
+        Ok(SecretString::from(first))
+    } else {
+        bail!(
+            "no new passphrase available: set SECRETS_NEW_PASSPHRASE or run attached to a terminal"
+        )
+    }
 }

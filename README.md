@@ -14,10 +14,10 @@ into a process's environment, so plaintext never touches disk.
 |---|---|---|
 | **M1** | Server: CRUD + encryption + token auth + admin CLI + tests | ✅ Done |
 | **M2** | Client: `run` / `get` / `set` / `list` / `export` | ✅ Done |
-| M3 | Offline encrypted cache, `rekey` (re-encrypt all), audit polish | ⏳ Planned |
+| **M3** | Offline encrypted cache, `rekey` (re-encrypt all), audit polish | ✅ Done |
 | M4 | musl static build, systemd unit, nginx sample, GitHub Actions release | ⏳ Planned |
 
-23 tests currently pass (11 crypto unit + 9 server integration + 3 client).
+26 tests currently pass (11 crypto unit + 10 server integration + 5 client/server unit).
 
 ## Architecture
 
@@ -89,6 +89,7 @@ Environment variables:
 SECRETS_PASSPHRASE=... secrets-server token create --name macbook --project cdn
 secrets-server token list
 secrets-server token revoke --name macbook
+secrets-server rekey
 
 # Run the server.
 SECRETS_PASSPHRASE=... secrets-server serve
@@ -142,6 +143,13 @@ secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-
 - `run` injects secrets into the **child** environment only (Unix `execvp`,
   Windows spawn+wait), propagates the child exit code, and never pollutes the
   parent environment or writes a `.env` file.
+- Successful fetches are cached locally as encrypted ciphertext for 24 hours.
+  The cache key is protected with macOS Keychain, Windows DPAPI, or a Linux/Unix
+  `0600` key file under the cache directory. `--no-cache` on `run` / `get` /
+  `list` / `export` disables cache reads and writes for that invocation.
+- If the server is unreachable, `run` / `get` / `list` / `export` fall back to a
+  fresh encrypted cache entry and print a warning to stderr. Auth failures and
+  HTTP errors do not use the cache.
 
 > Projects are provisioned via `POST /v1/projects` (admin/API); the client has
 > no project-create command.
@@ -151,8 +159,7 @@ secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-
 - Serve over plain HTTP on loopback **only**, behind a TLS-terminating proxy.
 - No secret value, token, key, or passphrase is ever written to logs, error
   messages, or debug output.
-- Offline caching, key rotation (`rekey`), and packaging (systemd/nginx/CI) are
-  planned for M3–M4 and not yet implemented.
+- Packaging (systemd/nginx/CI) is planned for M4 and not yet implemented.
 
 ## License
 
