@@ -24,6 +24,7 @@ cli = ["dep:anyhow", "dep:clap", "dep:rpassword"]
 secrets-crypto.workspace = true
 
 ureq.workspace = true
+url.workspace = true
 toml.workspace = true
 dirs.workspace = true
 rand.workspace = true
@@ -39,6 +40,9 @@ thiserror.workspace = true
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-dpapi = "0.2"

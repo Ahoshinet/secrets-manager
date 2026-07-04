@@ -78,15 +78,19 @@ pub fn export(api: &Api, project: &str, format: &str) -> Result<i32> {
         bail!("unsupported export format: {format} (only 'dotenv' is supported)");
     }
     let secrets = api.get_secrets(project)?;
-    let mut out = String::new();
+    // Zeroizing: the assembled dotenv text contains every plaintext value.
+    let mut out = zeroize::Zeroizing::new(String::new());
     for (k, v) in &secrets {
         out.push_str(k);
         out.push('=');
-        out.push_str(&dotenv_value(v.expose_secret()));
+        // Zeroizing: wiped on drop at the end of each iteration.
+        let value = zeroize::Zeroizing::new(dotenv_value(v.expose_secret()));
+        out.push_str(&value);
         out.push('\n');
     }
-    print!("{out}");
-    std::io::stdout().flush()?;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()?;
     Ok(0)
 }
 

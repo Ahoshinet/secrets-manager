@@ -4,15 +4,21 @@
 //! the `Authorization` header and never placed in the URL or logs.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
+use zeroize::Zeroizing;
 
 use crate::cache::CacheStore;
 use crate::config::Config;
 use crate::error::{Error, Result};
 
 pub type SecretMap = BTreeMap<String, SecretString>;
+
+/// Hard cap on response bodies read from the server. A hostile or
+/// compromised server must not be able to exhaust client memory.
+const MAX_RESPONSE_BYTES: u64 = 1 << 20; // 1 MiB
 
 pub struct Api {
     agent: ureq::Agent,
@@ -54,8 +60,8 @@ impl Api {
         }
     }
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.token.expose_secret())
+    fn auth_header(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("Bearer {}", self.token.expose_secret()))
     }
 
     /// Fetch and decrypt all secrets for a project.
@@ -101,10 +107,18 @@ impl Api {
 
         match resp {
             Ok(r) => {
-                let raw = r
-                    .into_json::<BTreeMap<String, String>>()
+                // Bounded read: never trust the server for response size.
+                let mut buf = Zeroizing::new(Vec::new());
+                r.into_reader()
+                    .take(MAX_RESPONSE_BYTES + 1)
+                    .read_to_end(&mut buf)
                     .map_err(|_| Error::UnexpectedResponse)?;
-                Ok(secret_map_from_plain(raw))
+                if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                    return Err(Error::UnexpectedResponse);
+                }
+                let raw: BTreeMap<String, String> =
+                    serde_json::from_slice(&buf).map_err(|_| Error::UnexpectedResponse)?;
+                secret_map_from_plain(raw)
             }
             Err(e) => Err(map_error(e)),
         }
@@ -112,12 +126,24 @@ impl Api {
 
     /// Set a single secret value.
     pub fn set_secret(&self, project: &str, key: &str, value: &SecretString) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct SetBody<'a> {
+            value: &'a str,
+        }
+
         let url = format!("{}/v1/projects/{}/secrets/{}", self.base, project, key);
+        let body = Zeroizing::new(
+            serde_json::to_vec(&SetBody {
+                value: value.expose_secret(),
+            })
+            .map_err(|_| Error::UnexpectedResponse)?,
+        );
         let resp = self
             .agent
             .put(&url)
             .set("Authorization", &self.auth_header())
-            .send_json(ureq::json!({ "value": value.expose_secret() }));
+            .set("Content-Type", "application/json")
+            .send_bytes(&body);
 
         match resp {
             Ok(_) => {
@@ -144,8 +170,52 @@ fn map_error(e: ureq::Error) -> Error {
     }
 }
 
-pub(crate) fn secret_map_from_plain(raw: BTreeMap<String, String>) -> SecretMap {
-    raw.into_iter()
-        .map(|(key, value)| (key, SecretString::from(value)))
-        .collect()
+/// Same key rules the server enforces on write. Applied to every key the
+/// client receives (from the network or the offline cache) before the key
+/// can reach a child-process environment or dotenv output, so a hostile
+/// server cannot inject `BAD\nX=Y`-style keys.
+fn valid_secret_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+pub(crate) fn secret_map_from_plain(raw: BTreeMap<String, String>) -> Result<SecretMap> {
+    let mut out = SecretMap::new();
+    for (key, value) in raw {
+        if !valid_secret_key(&key) {
+            // Deliberately does not echo the hostile key material.
+            return Err(Error::UnexpectedResponse);
+        }
+        out.insert(key, SecretString::from(value));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_server_keys() {
+        for bad in ["", "BAD\nX=Y", "a b", "k=v", "🔥", &"k".repeat(129)] {
+            let mut raw = BTreeMap::new();
+            raw.insert(bad.to_string(), "v".to_string());
+            assert!(
+                secret_map_from_plain(raw).is_err(),
+                "key {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_keys() {
+        let mut raw = BTreeMap::new();
+        raw.insert("DATABASE_URL".to_string(), "v".to_string());
+        raw.insert("api.key-2".to_string(), "v".to_string());
+        let map = secret_map_from_plain(raw).unwrap();
+        assert_eq!(map.len(), 2);
+    }
 }

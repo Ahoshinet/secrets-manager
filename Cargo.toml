@@ -26,6 +26,7 @@ base64 = "0.22"
 
 # Client
 ureq = { version = "2", features = ["json"] }
+url = "2"
 toml = "0.8"
 dirs = "5"
 

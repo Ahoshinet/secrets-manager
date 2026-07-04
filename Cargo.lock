@@ -1139,6 +1139,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "libc",
  "rand",
  "rpassword",
  "secrecy",
@@ -1151,6 +1152,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "ureq",
+ "url",
  "windows-dpapi",
  "zeroize",
 ]

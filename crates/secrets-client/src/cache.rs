@@ -24,10 +24,13 @@ use crate::api::{secret_map_from_plain, SecretMap};
 use crate::config::Config;
 use crate::error::{Error, Result};
 
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const CACHE_AAD_PREFIX: &[u8] = b"secrets-manager-client-cache-v1";
+const CACHE_AAD_PREFIX: &[u8] = b"secrets-manager-client-cache-v2";
 const KEY_ENTROPY: &[u8] = b"secrets-manager-cache-key-v1";
+/// Tolerated forward clock skew when validating `created_at_unix`.
+/// Anything further in the future than this is treated as tampering.
+const MAX_FUTURE_SKEW_SECS: u64 = 120;
 
 pub struct CacheStore {
     dir: PathBuf,
@@ -53,6 +56,19 @@ impl CacheStore {
                 dir.display()
             ))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dir)
+                .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", dir.display())))?
+                .permissions();
+            if perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o700);
+                fs::set_permissions(&dir, perms).map_err(|e| {
+                    Error::Cache(format!("failed to chmod {}: {e}", dir.display()))
+                })?;
+            }
+        }
         let key = load_or_create_cache_key(&dir)?;
         Ok(CacheStore {
             dir,
@@ -69,12 +85,15 @@ impl CacheStore {
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut plaintext = serde_json::to_vec(&plain)
             .map_err(|e| Error::Cache(format!("failed to encode cache payload: {e}")))?;
-        let (nonce, ciphertext) = encrypt(&self.key, &plaintext, &self.aad(project))
+        let created_at_unix = now_unix()?;
+        // The timestamp is part of the AAD so a cache-file writer cannot
+        // refresh `created_at_unix` to replay a stale ciphertext past its TTL.
+        let (nonce, ciphertext) = encrypt(&self.key, &plaintext, &self.aad(project, created_at_unix))
             .map_err(|_| Error::Cache("failed to encrypt cache payload".to_string()))?;
         plaintext.zeroize();
         let envelope = Envelope {
             version: CACHE_VERSION,
-            created_at_unix: now_unix()?,
+            created_at_unix,
             nonce: b64_encode(&nonce),
             ciphertext: b64_encode(&ciphertext),
         };
@@ -92,31 +111,46 @@ impl CacheStore {
         if envelope.version != CACHE_VERSION {
             return Err(Error::Cache("unsupported cache version".to_string()));
         }
-        let age = now_unix()?.saturating_sub(envelope.created_at_unix);
+        let now = now_unix()?;
+        if envelope.created_at_unix > now + MAX_FUTURE_SKEW_SECS {
+            return Err(Error::Cache(
+                "cache timestamp is in the future; refusing to use it".to_string(),
+            ));
+        }
+        let age = now.saturating_sub(envelope.created_at_unix);
         if age > CACHE_TTL.as_secs() {
             return Err(Error::Cache("cache expired".to_string()));
         }
 
         let nonce = b64_decode(&envelope.nonce)?;
         let mut ciphertext = b64_decode(&envelope.ciphertext)?;
-        let mut plaintext = decrypt(&self.key, &nonce, &ciphertext, &self.aad(project))
-            .map_err(|_| Error::Cache("failed to decrypt cache payload".to_string()))?;
+        // Decryption authenticates the timestamp via the AAD.
+        let mut plaintext = decrypt(
+            &self.key,
+            &nonce,
+            &ciphertext,
+            &self.aad(project, envelope.created_at_unix),
+        )
+        .map_err(|_| Error::Cache("failed to decrypt cache payload".to_string()))?;
         ciphertext.zeroize();
 
-        let out = serde_json::from_slice(&plaintext)
-            .map(secret_map_from_plain)
+        let raw: std::collections::BTreeMap<String, String> = serde_json::from_slice(&plaintext)
             .map_err(|e| Error::Cache(format!("failed to parse cache payload: {e}")))?;
         plaintext.zeroize();
-        Ok(out)
+        secret_map_from_plain(raw)
     }
 
     pub fn remove(&self, project: &str) {
         let _ = fs::remove_file(self.cache_path(project));
     }
 
-    fn aad(&self, project: &str) -> Vec<u8> {
+    fn aad(&self, project: &str, created_at_unix: u64) -> Vec<u8> {
         let mut aad = Vec::with_capacity(
-            CACHE_AAD_PREFIX.len() + self.server_url.len() + self.token_hash.len() + project.len(),
+            CACHE_AAD_PREFIX.len()
+                + self.server_url.len()
+                + self.token_hash.len()
+                + project.len()
+                + 8,
         );
         aad.extend_from_slice(CACHE_AAD_PREFIX);
         aad.extend_from_slice(&(self.server_url.len() as u32).to_le_bytes());
@@ -124,6 +158,7 @@ impl CacheStore {
         aad.extend_from_slice(&self.token_hash);
         aad.extend_from_slice(&(project.len() as u32).to_le_bytes());
         aad.extend_from_slice(project.as_bytes());
+        aad.extend_from_slice(&created_at_unix.to_le_bytes());
         aad
     }
 
@@ -247,11 +282,14 @@ fn load_or_create_cache_key(_dir: &Path) -> Result<MasterKey> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
+    use std::io::Read as _;
+
     let path = dir.join("cache-key");
     if path.exists() {
-        ensure_private_permissions(&path)?;
-        let mut raw =
-            fs::read(&path).map_err(|e| Error::Cache(format!("failed to read cache key: {e}")))?;
+        let mut file = open_private_for_read(&path)?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| Error::Cache(format!("failed to read cache key: {e}")))?;
         let key = key_from_slice(&raw)?;
         raw.zeroize();
         return Ok(key);
@@ -291,28 +329,51 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
             ))
         })?;
     }
-    let tmp = path.with_extension("tmp");
-    {
+    // Randomized temp name + `create_new` (O_CREAT|O_EXCL): an attacker who
+    // pre-plants a file or symlink at the temp path makes the open fail
+    // instead of us writing through it.
+    let tmp = random_temp_sibling(path)?;
+    let write_result = (|| -> Result<()> {
         let mut file = private_open_for_write(&tmp)?;
         file.write_all(data)
             .map_err(|e| Error::Cache(format!("failed to write {}: {e}", tmp.display())))?;
         file.flush()
             .map_err(|e| Error::Cache(format!("failed to flush {}: {e}", tmp.display())))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)
-        .map_err(|e| Error::Cache(format!("failed to replace {}: {e}", path.display())))?;
-    set_private_permissions(path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error::Cache(format!(
+            "failed to replace {}: {e}",
+            path.display()
+        )));
+    }
     Ok(())
+}
+
+fn random_temp_sibling(path: &Path) -> Result<PathBuf> {
+    let mut suffix = [0u8; 16];
+    OsRng.fill_bytes(&mut suffix);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::Cache(format!("invalid cache path {}", path.display())))?;
+    let mut name = file_name.to_os_string();
+    name.push(format!(".{}.tmp", b64_encode(&suffix)));
+    Ok(path.with_file_name(name))
 }
 
 #[cfg(unix)]
 fn private_open_for_write(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| Error::Cache(format!("failed to open {}: {e}", path.display())))
 }
@@ -320,38 +381,35 @@ fn private_open_for_write(path: &Path) -> Result<std::fs::File> {
 #[cfg(not(unix))]
 fn private_open_for_write(path: &Path) -> Result<std::fs::File> {
     OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .open(path)
         .map_err(|e| Error::Cache(format!("failed to open {}: {e}", path.display())))
 }
 
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)
-        .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", path.display())))?
-        .permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|e| Error::Cache(format!("failed to chmod {}: {e}", path.display())))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
+/// Open an existing private file for reading without following symlinks,
+/// then validate the opened fd's metadata (regular file, 0600) so the
+/// check cannot be raced against the open.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn ensure_private_permissions(path: &Path) -> Result<()> {
+fn open_private_for_read(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)
-        .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", path.display())))?
-        .permissions()
-        .mode()
-        & 0o777;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| Error::Cache(format!("failed to open {}: {e}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(Error::Cache(format!(
+            "{} is not a regular file; refusing to use it",
+            path.display()
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(Error::Cache(format!(
             "{} has permissions {:04o}; refusing to use cache key unless it is 0600",
@@ -359,13 +417,16 @@ fn ensure_private_permissions(path: &Path) -> Result<()> {
             mode
         )));
     }
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use secrecy::SecretString;
+
+    // Tests mutate the process-wide SECRETS_CACHE_DIR env var; serialize them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_cfg() -> Config {
         Config {
@@ -376,6 +437,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_is_encrypted_and_bound_to_project() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
         let cache = CacheStore::open(&test_cfg()).unwrap();
@@ -401,6 +463,57 @@ mod tests {
             "postgres://secret"
         );
         assert!(cache.load("other-project").is_err());
+
+        std::env::remove_var("SECRETS_CACHE_DIR");
+    }
+
+    #[test]
+    fn tampered_timestamp_fails_decryption() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
+        let cache = CacheStore::open(&test_cfg()).unwrap();
+
+        let mut secrets = SecretMap::new();
+        secrets.insert(
+            "API_KEY".to_string(),
+            SecretString::from("value".to_string()),
+        );
+        cache.store("proj", &secrets).unwrap();
+
+        // Rewind the plaintext timestamp: decryption must fail because the
+        // timestamp is bound into the AAD.
+        let path = cache.cache_path("proj");
+        let mut envelope: Envelope =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope.created_at_unix -= 3600;
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(cache.load("proj").is_err());
+
+        std::env::remove_var("SECRETS_CACHE_DIR");
+    }
+
+    #[test]
+    fn future_timestamp_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
+        let cache = CacheStore::open(&test_cfg()).unwrap();
+
+        let mut secrets = SecretMap::new();
+        secrets.insert(
+            "API_KEY".to_string(),
+            SecretString::from("value".to_string()),
+        );
+        cache.store("proj", &secrets).unwrap();
+
+        let path = cache.cache_path("proj");
+        let mut envelope: Envelope =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope.created_at_unix += MAX_FUTURE_SKEW_SECS + 3600;
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let err = cache.load("proj").unwrap_err().to_string();
+        assert!(err.contains("future"), "unexpected error: {err}");
 
         std::env::remove_var("SECRETS_CACHE_DIR");
     }
