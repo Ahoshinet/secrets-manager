@@ -25,6 +25,33 @@ const K_P: &str = "kdf_p_cost";
 const K_VNONCE: &str = "verifier_nonce";
 const K_VCT: &str = "verifier_ct";
 
+// Local bounds on KDF parameters read from the database. The KDF metadata
+// is not authenticated (it must be readable before any key exists), so a
+// database writer could otherwise plant absurd Argon2 costs and DoS
+// startup/rekey before the verifier decryption ever runs.
+const KDF_M_COST_KIB_MIN: u32 = 8; // argon2 crate minimum
+const KDF_M_COST_KIB_MAX: u32 = 1024 * 1024; // 1 GiB
+const KDF_T_COST_MIN: u32 = 1;
+const KDF_T_COST_MAX: u32 = 32;
+const KDF_P_COST_MIN: u32 = 1;
+const KDF_P_COST_MAX: u32 = 8;
+
+fn validate_kdf_params(params: &KdfParams) -> Result<()> {
+    let ok = (KDF_M_COST_KIB_MIN..=KDF_M_COST_KIB_MAX).contains(&params.m_cost_kib)
+        && (KDF_T_COST_MIN..=KDF_T_COST_MAX).contains(&params.t_cost)
+        && (KDF_P_COST_MIN..=KDF_P_COST_MAX).contains(&params.p_cost);
+    if !ok {
+        bail!(
+            "kdf parameters stored in the database are outside the supported range \
+             (m={} KiB, t={}, p={}); refusing to derive a key (possible tampering)",
+            params.m_cost_kib,
+            params.t_cost,
+            params.p_cost
+        );
+    }
+    Ok(())
+}
+
 /// AAD binding the verifier record. Uses reserved names that can never
 /// collide with a real project/key.
 fn verifier_aad() -> Vec<u8> {
@@ -170,6 +197,7 @@ fn verify(conn: &Connection, passphrase: &SecretString, salt: &[u8]) -> Result<M
         t_cost: t,
         p_cost: p,
     };
+    validate_kdf_params(&params)?;
 
     let key = derive_key(passphrase, salt, params).map_err(|e| anyhow!(e))?;
 
@@ -231,5 +259,24 @@ mod tests {
         assert_ne!(rows[0].ciphertext, ciphertext);
         let plaintext = decrypt(&new_key, &rows[0].nonce, &rows[0].ciphertext, &aad).unwrap();
         assert_eq!(plaintext, b"postgres://secret");
+    }
+
+    #[test]
+    fn oversized_kdf_params_are_rejected_before_derivation() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+
+        let pass = SecretString::from("passphrase".to_string());
+        initialize_with_params(&conn, &pass, cheap_params()).unwrap();
+
+        // Simulate a database writer planting a huge m_cost to DoS startup.
+        repo::set_meta(&conn, K_M, &u32_to_le(u32::MAX)).unwrap();
+
+        let salt = repo::get_meta(&conn, K_SALT).unwrap().unwrap();
+        let err = verify(&conn, &pass, &salt).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the supported range"),
+            "unexpected error: {err}"
+        );
     }
 }

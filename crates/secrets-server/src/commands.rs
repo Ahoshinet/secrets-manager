@@ -11,7 +11,7 @@ use secrets_crypto::{generate_token, hash_token};
 use crate::app::{self, AppState};
 use crate::audit::AuditLog;
 use crate::config::{acquire_passphrase, Config};
-use crate::{crypto_state, db, repo};
+use crate::{crypto_state, db, lock, repo};
 
 #[derive(Parser)]
 #[command(
@@ -80,6 +80,14 @@ fn valid_name(name: &str) -> bool {
 
 fn serve() -> Result<()> {
     let cfg = Config::from_env()?;
+
+    // Exclusive DB lock for the server's lifetime: prevents a concurrent
+    // `rekey` from swapping the master key under a running process.
+    let _db_lock = lock::acquire(
+        &cfg.db_path,
+        "another secrets-server appears to be running on this database",
+    )?;
+
     let passphrase = acquire_passphrase()?;
 
     let conn = db::open(&cfg.db_path)?;
@@ -180,6 +188,15 @@ fn token_list() -> Result<()> {
 
 fn rekey() -> Result<()> {
     let cfg = Config::from_env()?;
+
+    // Refuse to rekey while a server holds the database. A running server
+    // caches the old master key in memory and would keep writing old-key
+    // ciphertext after the rekey, corrupting those secrets.
+    let _db_lock = lock::acquire(
+        &cfg.db_path,
+        "stop the running secrets-server before rekeying",
+    )?;
+
     let current = acquire_passphrase()?;
     let new_passphrase = acquire_new_passphrase(&current)?;
 
