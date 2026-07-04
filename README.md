@@ -15,9 +15,9 @@ into a process's environment, so plaintext never touches disk.
 | **M1** | Server: CRUD + encryption + token auth + admin CLI + tests | ✅ Done |
 | **M2** | Client: `run` / `get` / `set` / `list` / `export` | ✅ Done |
 | **M3** | Offline encrypted cache, `rekey` (re-encrypt all), audit polish | ✅ Done |
-| M4 | musl static build, systemd unit, nginx sample, GitHub Actions release | ⏳ Planned |
+| **M4** | musl static build, systemd unit, nginx sample, GitHub Actions release | ✅ Done |
 
-26 tests currently pass (11 crypto unit + 10 server integration + 5 client/server unit).
+28 tests currently pass (11 crypto unit + 10 server integration + 7 client/server unit).
 
 ## Architecture
 
@@ -69,17 +69,32 @@ cargo clippy --workspace --all-targets
 
 Binaries: `target/release/secrets-server` and `target/release/secrets`.
 
+### Static Linux build
+
+For a self-contained Linux release build:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools
+cargo build --release --locked --target x86_64-unknown-linux-musl --bins
+```
+
+The tag release workflow builds this target and verifies the produced binaries
+do not declare dynamic dependencies.
+
 ## Server usage
 
-The server takes its master passphrase from `SECRETS_PASSPHRASE` (intended to
-be supplied by systemd `LoadCredential`) or, if absent and attached to a TTY,
-an interactive prompt.
+The server takes its master passphrase from `SECRETS_PASSPHRASE`,
+`SECRETS_PASSPHRASE_FILE`, systemd `LoadCredential=secrets-passphrase`, or, if
+attached to a TTY, an interactive prompt. Passphrase files must be private on
+Unix (no group/other permissions); a single trailing newline is ignored.
 
 Environment variables:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SECRETS_PASSPHRASE` | — | master passphrase (else TTY prompt) |
+| `SECRETS_PASSPHRASE` | — | master passphrase |
+| `SECRETS_PASSPHRASE_FILE` | — | path to a private master passphrase file |
 | `SECRETS_DB_PATH` | `secrets.db` | SQLite path |
 | `SECRETS_AUDIT_PATH` | `audit.jsonl` | audit log path |
 | `SECRETS_BIND` | `127.0.0.1:8787` | listen address (keep loopback) |
@@ -94,6 +109,35 @@ secrets-server rekey
 # Run the server.
 SECRETS_PASSPHRASE=... secrets-server serve
 ```
+
+## Deployment
+
+Sample deployment files live under `deploy/`:
+
+- `deploy/systemd/secrets-server.service` runs `secrets-server serve` as a
+  dedicated `secrets` user, keeps the HTTP bind on `127.0.0.1:8787`, stores the
+  DB under `/var/lib/secrets-manager`, writes audit JSONL under
+  `/var/log/secrets-manager`, and loads the master passphrase from
+  `/etc/secrets-manager/master-passphrase` using systemd credentials.
+- `deploy/nginx/secrets-manager.conf` terminates TLS and reverse-proxies to the
+  loopback server. Replace `secrets.example.com` and certificate paths before
+  enabling it.
+
+Minimal Linux install sketch:
+
+```bash
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/secrets-server /usr/local/bin/secrets-server
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/secrets /usr/local/bin/secrets
+sudo useradd --system --home /var/lib/secrets-manager --shell /usr/sbin/nologin secrets
+sudo install -d -m 0700 -o root -g root /etc/secrets-manager
+sudo install -m 0600 -o root -g root /path/to/master-passphrase /etc/secrets-manager/master-passphrase
+sudo install -m 0644 deploy/systemd/secrets-server.service /etc/systemd/system/secrets-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now secrets-server
+```
+
+Releases are created by GitHub Actions when a `v*` tag is pushed. The release
+archive contains static Linux binaries plus the deploy samples.
 
 ### HTTP API (all except `/v1/health` require `Authorization: Bearer <token>`)
 
@@ -159,7 +203,9 @@ secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-
 - Serve over plain HTTP on loopback **only**, behind a TLS-terminating proxy.
 - No secret value, token, key, or passphrase is ever written to logs, error
   messages, or debug output.
-- Packaging (systemd/nginx/CI) is planned for M4 and not yet implemented.
+- Use the included systemd/nginx samples as the production shape: plain HTTP on
+  loopback, TLS at nginx, and the master passphrase supplied through a private
+  file or systemd credential.
 
 ## License
 
