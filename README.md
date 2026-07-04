@@ -227,10 +227,18 @@ can disable default features when they do not need the CLI.
 
 ### Go library usage
 
-A native Go client lives in `clients/go` and speaks the same HTTP API over
-HTTPS.
+The native Go client lives in its own repository:
+**[Ahoshinet/secrets-manager-go](https://github.com/Ahoshinet/secrets-manager-go)**.
+It speaks the same HTTP API over HTTPS, tracking the contract in
+[`docs/API.md`](docs/API.md).
+
+```bash
+go get github.com/Ahoshinet/secrets-manager-go@latest
+```
 
 ```go
+import secrets "github.com/Ahoshinet/secrets-manager-go"
+
 client, err := secrets.New(secrets.Config{
     ServerURL: "https://secrets.example.com",
     Token:     token,
@@ -257,4 +265,4 @@ defer databaseURL.Zeroize()
 
 ## License
 
-MIT.
+BSD 2-Clause. See [LICENSE](LICENSE).

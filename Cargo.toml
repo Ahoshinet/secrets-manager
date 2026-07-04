@@ -10,8 +10,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
-authors = ["darui3018823"]
+license = "BSD-2-Clause"
+authors = ["Ahoshinet Groups", "darui3018823"]
 
 [workspace.dependencies]
 # Cryptography (RustCrypto only — no custom crypto)
