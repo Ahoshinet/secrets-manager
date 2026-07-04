@@ -6,40 +6,19 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use secrecy::{ExposeSecret, SecretString};
-use thiserror::Error;
 
 use crate::cache::CacheStore;
 use crate::config::Config;
+use crate::error::{Error, Result};
+
+pub type SecretMap = BTreeMap<String, SecretString>;
 
 pub struct Api {
     agent: ureq::Agent,
     base: String,
     token: SecretString,
     cache: Option<CacheStore>,
-}
-
-#[derive(Debug, Error)]
-enum ApiError {
-    #[error("server returned an unexpected response")]
-    UnexpectedResponse,
-    #[error("unauthorized (check your token)")]
-    Unauthorized,
-    #[error("forbidden (token not permitted for this project)")]
-    Forbidden,
-    #[error("not found")]
-    NotFound,
-    #[error("server error (HTTP {0})")]
-    Http(u16),
-    #[error("cannot reach server: {0}")]
-    Transport(String),
-}
-
-impl ApiError {
-    fn is_transport(&self) -> bool {
-        matches!(self, ApiError::Transport(_))
-    }
 }
 
 impl Api {
@@ -79,8 +58,8 @@ impl Api {
         format!("Bearer {}", self.token.expose_secret())
     }
 
-    /// Fetch and decrypt all secrets for a project as a key/value map.
-    pub fn get_secrets(&self, project: &str) -> Result<BTreeMap<String, String>> {
+    /// Fetch and decrypt all secrets for a project.
+    pub fn get_secrets(&self, project: &str) -> Result<SecretMap> {
         match self.fetch_secrets(project) {
             Ok(secrets) => {
                 if let Some(cache) = &self.cache {
@@ -99,22 +78,20 @@ impl Api {
                             );
                             Ok(secrets)
                         }
-                        Err(cache_err) => {
-                            Err(anyhow!("{e}; no usable offline cache ({cache_err})"))
-                        }
+                        Err(cache_err) => Err(Error::OfflineCacheUnavailable {
+                            transport: e.to_string(),
+                            cache: cache_err.to_string(),
+                        }),
                     }
                 } else {
-                    Err(anyhow!(e))
+                    Err(e)
                 }
             }
-            Err(e) => Err(anyhow!(e)),
+            Err(e) => Err(e),
         }
     }
 
-    fn fetch_secrets(
-        &self,
-        project: &str,
-    ) -> std::result::Result<BTreeMap<String, String>, ApiError> {
+    fn fetch_secrets(&self, project: &str) -> Result<SecretMap> {
         let url = format!("{}/v1/projects/{}/secrets", self.base, project);
         let resp = self
             .agent
@@ -123,9 +100,12 @@ impl Api {
             .call();
 
         match resp {
-            Ok(r) => r
-                .into_json::<BTreeMap<String, String>>()
-                .map_err(|_| ApiError::UnexpectedResponse),
+            Ok(r) => {
+                let raw = r
+                    .into_json::<BTreeMap<String, String>>()
+                    .map_err(|_| Error::UnexpectedResponse)?;
+                Ok(secret_map_from_plain(raw))
+            }
             Err(e) => Err(map_error(e)),
         }
     }
@@ -148,19 +128,24 @@ impl Api {
             }
             Err(e) => Err(map_error(e)),
         }
-        .map_err(|e| anyhow!(e))
     }
 }
 
 /// Map a ureq error to a clean, non-leaking message.
-fn map_error(e: ureq::Error) -> ApiError {
+fn map_error(e: ureq::Error) -> Error {
     match e {
         ureq::Error::Status(code, _resp) => match code {
-            401 => ApiError::Unauthorized,
-            403 => ApiError::Forbidden,
-            404 => ApiError::NotFound,
-            _ => ApiError::Http(code),
+            401 => Error::Unauthorized,
+            403 => Error::Forbidden,
+            404 => Error::NotFound,
+            _ => Error::Http(code),
         },
-        ureq::Error::Transport(t) => ApiError::Transport(t.kind().to_string()),
+        ureq::Error::Transport(t) => Error::Transport(t.kind().to_string()),
     }
+}
+
+pub(crate) fn secret_map_from_plain(raw: BTreeMap<String, String>) -> SecretMap {
+    raw.into_iter()
+        .map(|(key, value)| (key, SecretString::from(value)))
+        .collect()
 }

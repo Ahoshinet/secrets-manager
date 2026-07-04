@@ -16,8 +16,11 @@ into a process's environment, so plaintext never touches disk.
 | **M2** | Client: `run` / `get` / `set` / `list` / `export` | ✅ Done |
 | **M3** | Offline encrypted cache, `rekey` (re-encrypt all), audit polish | ✅ Done |
 | **M4** | musl static build, systemd unit, nginx sample, GitHub Actions release | ✅ Done |
+| **M5** | Rust client library polish: typed errors, CLI feature gate, secret-safe values | ✅ Done |
+| **M6** | Native Go client library | ✅ Done |
 
-28 tests currently pass (11 crypto unit + 10 server integration + 7 client/server unit).
+Rust: 28 tests currently pass (11 crypto unit + 10 server integration + 7 client/server unit).
+Go client: 5 tests currently pass.
 
 ## Architecture
 
@@ -37,6 +40,8 @@ crates/
 ├─ secrets-crypto/   # pure crypto core, no I/O (fully unit-tested)
 ├─ secrets-server/   # axum + rusqlite; server + admin CLI (lib + bin)
 └─ secrets-client/   # ureq-based client CLI `secrets` (lib + bin)
+clients/
+└─ go/                # native Go client library
 ```
 
 ## Cryptography
@@ -197,6 +202,49 @@ secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-
 
 > Projects are provisioned via `POST /v1/projects` (admin/API); the client has
 > no project-create command.
+
+### Rust library usage
+
+`secrets-client` can be embedded directly by Rust applications. The public API
+uses a typed `secrets_client::Error` and returns values as `SecretString` rather
+than plaintext `String`.
+
+```rust
+use secrets_client::{Api, Config};
+
+let cfg = Config {
+    server_url: "https://secrets.example.com".to_string(),
+    token: secrecy::SecretString::from("token".to_string()),
+};
+let api = Api::new(&cfg);
+let secrets = api.get_secrets("cdn")?;
+let database_url = secrets.get("DATABASE_URL");
+```
+
+CLI-only dependencies (`clap`, `rpassword`, `anyhow`) are behind the `cli`
+feature. It is enabled by default for normal binary builds; library consumers
+can disable default features when they do not need the CLI.
+
+### Go library usage
+
+A native Go client lives in `clients/go` and speaks the same HTTP API over
+HTTPS.
+
+```go
+client, err := secrets.New(secrets.Config{
+    ServerURL: "https://secrets.example.com",
+    Token:     token,
+})
+if err != nil {
+    return err
+}
+values, err := client.GetSecrets(ctx, "cdn")
+if err != nil {
+    return err
+}
+databaseURL := values["DATABASE_URL"]
+defer databaseURL.Zeroize()
+```
 
 ## Security notes / non-goals
 

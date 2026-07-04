@@ -6,13 +6,11 @@
 //! - Windows: DPAPI, current-user scope
 //! - Linux/other Unix: a `0600` key file under the cache directory
 
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -22,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+use crate::api::{secret_map_from_plain, SecretMap};
 use crate::config::Config;
+use crate::error::{Error, Result};
 
 const CACHE_VERSION: u8 = 1;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -47,8 +47,12 @@ struct Envelope {
 impl CacheStore {
     pub fn open(cfg: &Config) -> Result<Self> {
         let dir = cache_dir()?;
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create cache directory at {}", dir.display()))?;
+        fs::create_dir_all(&dir).map_err(|e| {
+            Error::Cache(format!(
+                "failed to create cache directory at {}: {e}",
+                dir.display()
+            ))
+        })?;
         let key = load_or_create_cache_key(&dir)?;
         Ok(CacheStore {
             dir,
@@ -58,10 +62,15 @@ impl CacheStore {
         })
     }
 
-    pub fn store(&self, project: &str, secrets: &BTreeMap<String, String>) -> Result<()> {
-        let mut plaintext = serde_json::to_vec(secrets).context("failed to encode cache payload")?;
+    pub fn store(&self, project: &str, secrets: &SecretMap) -> Result<()> {
+        let plain = secrets
+            .iter()
+            .map(|(key, value)| (key, value.expose_secret()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut plaintext = serde_json::to_vec(&plain)
+            .map_err(|e| Error::Cache(format!("failed to encode cache payload: {e}")))?;
         let (nonce, ciphertext) = encrypt(&self.key, &plaintext, &self.aad(project))
-            .map_err(|_| anyhow!("failed to encrypt cache payload"))?;
+            .map_err(|_| Error::Cache("failed to encrypt cache payload".to_string()))?;
         plaintext.zeroize();
         let envelope = Envelope {
             version: CACHE_VERSION,
@@ -69,30 +78,34 @@ impl CacheStore {
             nonce: b64_encode(&nonce),
             ciphertext: b64_encode(&ciphertext),
         };
-        let data = serde_json::to_vec(&envelope).context("failed to encode cache envelope")?;
+        let data = serde_json::to_vec(&envelope)
+            .map_err(|e| Error::Cache(format!("failed to encode cache envelope: {e}")))?;
         write_private_file(&self.cache_path(project), &data)?;
         Ok(())
     }
 
-    pub fn load(&self, project: &str) -> Result<BTreeMap<String, String>> {
-        let data = fs::read(self.cache_path(project)).context("failed to read cache")?;
-        let envelope: Envelope =
-            serde_json::from_slice(&data).context("failed to parse cache envelope")?;
+    pub fn load(&self, project: &str) -> Result<SecretMap> {
+        let data = fs::read(self.cache_path(project))
+            .map_err(|e| Error::Cache(format!("failed to read cache: {e}")))?;
+        let envelope: Envelope = serde_json::from_slice(&data)
+            .map_err(|e| Error::Cache(format!("failed to parse cache envelope: {e}")))?;
         if envelope.version != CACHE_VERSION {
-            bail!("unsupported cache version");
+            return Err(Error::Cache("unsupported cache version".to_string()));
         }
         let age = now_unix()?.saturating_sub(envelope.created_at_unix);
         if age > CACHE_TTL.as_secs() {
-            bail!("cache expired");
+            return Err(Error::Cache("cache expired".to_string()));
         }
 
         let nonce = b64_decode(&envelope.nonce)?;
         let mut ciphertext = b64_decode(&envelope.ciphertext)?;
         let mut plaintext = decrypt(&self.key, &nonce, &ciphertext, &self.aad(project))
-            .map_err(|_| anyhow!("failed to decrypt cache payload"))?;
+            .map_err(|_| Error::Cache("failed to decrypt cache payload".to_string()))?;
         ciphertext.zeroize();
 
-        let out = serde_json::from_slice(&plaintext).context("failed to parse cache payload")?;
+        let out = serde_json::from_slice(&plaintext)
+            .map(secret_map_from_plain)
+            .map_err(|e| Error::Cache(format!("failed to parse cache payload: {e}")))?;
         plaintext.zeroize();
         Ok(out)
     }
@@ -130,14 +143,15 @@ fn cache_dir() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("SECRETS_CACHE_DIR") {
         return Ok(PathBuf::from(p));
     }
-    let base = dirs::cache_dir().ok_or_else(|| anyhow!("cannot determine cache directory"))?;
+    let base = dirs::cache_dir()
+        .ok_or_else(|| Error::Cache("cannot determine cache directory".to_string()))?;
     Ok(base.join("secrets"))
 }
 
 fn now_unix() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
+        .map_err(|e| Error::Cache(format!("system clock is before Unix epoch: {e}")))?
         .as_secs())
 }
 
@@ -148,7 +162,7 @@ fn b64_encode(bytes: &[u8]) -> String {
 fn b64_decode(s: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .context("invalid base64 in cache")
+        .map_err(|e| Error::Cache(format!("invalid base64 in cache: {e}")))
 }
 
 fn random_key() -> [u8; 32] {
@@ -160,7 +174,7 @@ fn random_key() -> [u8; 32] {
 fn key_from_slice(bytes: &[u8]) -> Result<MasterKey> {
     let mut raw = [0u8; 32];
     if bytes.len() != raw.len() {
-        bail!("invalid cache key length");
+        return Err(Error::Cache("invalid cache key length".to_string()));
     }
     raw.copy_from_slice(bytes);
     Ok(MasterKey::from_bytes(raw))
@@ -172,17 +186,18 @@ fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
 
     let path = dir.join("cache-key.dpapi");
     if path.exists() {
-        let protected = fs::read(&path).context("failed to read DPAPI cache key")?;
+        let protected = fs::read(&path)
+            .map_err(|e| Error::Cache(format!("failed to read DPAPI cache key: {e}")))?;
         let mut raw = decrypt_data(&protected, Scope::User, Some(KEY_ENTROPY))
-            .context("DPAPI decrypt failed")?;
+            .map_err(|e| Error::Cache(format!("DPAPI decrypt failed: {e}")))?;
         let key = key_from_slice(&raw)?;
         raw.zeroize();
         return Ok(key);
     }
 
     let mut raw = random_key();
-    let protected =
-        encrypt_data(&raw, Scope::User, Some(KEY_ENTROPY)).context("DPAPI encrypt failed")?;
+    let protected = encrypt_data(&raw, Scope::User, Some(KEY_ENTROPY))
+        .map_err(|e| Error::Cache(format!("DPAPI encrypt failed: {e}")))?;
     write_private_file(&path, &protected)?;
     let key = MasterKey::from_bytes(raw);
     raw.zeroize();
@@ -197,8 +212,11 @@ fn load_or_create_cache_key(_dir: &Path) -> Result<MasterKey> {
 
     match security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
         Ok(encoded) => {
-            let mut encoded = String::from_utf8(encoded)
-                .context("cache key in macOS Keychain is not valid UTF-8")?;
+            let mut encoded = String::from_utf8(encoded).map_err(|e| {
+                Error::Cache(format!(
+                    "cache key in macOS Keychain is not valid UTF-8: {e}"
+                ))
+            })?;
             let mut raw = b64_decode(&encoded)?;
             encoded.zeroize();
             let key = key_from_slice(&raw)?;
@@ -213,13 +231,17 @@ fn load_or_create_cache_key(_dir: &Path) -> Result<MasterKey> {
                 ACCOUNT,
                 encoded.as_bytes(),
             )
-            .context("failed to store cache key in macOS Keychain")?;
+            .map_err(|e| {
+                Error::Cache(format!("failed to store cache key in macOS Keychain: {e}"))
+            })?;
             encoded.zeroize();
             let key = MasterKey::from_bytes(raw);
             raw.zeroize();
             Ok(key)
         }
-        Err(e) => Err(anyhow!("failed to read cache key from macOS Keychain: {e}")),
+        Err(e) => Err(Error::Cache(format!(
+            "failed to read cache key from macOS Keychain: {e}"
+        ))),
     }
 }
 
@@ -228,7 +250,8 @@ fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
     let path = dir.join("cache-key");
     if path.exists() {
         ensure_private_permissions(&path)?;
-        let mut raw = fs::read(&path).context("failed to read cache key")?;
+        let mut raw =
+            fs::read(&path).map_err(|e| Error::Cache(format!("failed to read cache key: {e}")))?;
         let key = key_from_slice(&raw)?;
         raw.zeroize();
         return Ok(key);
@@ -245,7 +268,8 @@ fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
 fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
     let path = dir.join("cache-key");
     if path.exists() {
-        let mut raw = fs::read(&path).context("failed to read cache key")?;
+        let mut raw =
+            fs::read(&path).map_err(|e| Error::Cache(format!("failed to read cache key: {e}")))?;
         let key = key_from_slice(&raw)?;
         raw.zeroize();
         return Ok(key);
@@ -260,18 +284,23 @@ fn load_or_create_cache_key(dir: &Path) -> Result<MasterKey> {
 
 fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory at {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            Error::Cache(format!(
+                "failed to create directory at {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
     let tmp = path.with_extension("tmp");
     {
         let mut file = private_open_for_write(&tmp)?;
         file.write_all(data)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+            .map_err(|e| Error::Cache(format!("failed to write {}: {e}", tmp.display())))?;
         file.flush()
-            .with_context(|| format!("failed to flush {}", tmp.display()))?;
+            .map_err(|e| Error::Cache(format!("failed to flush {}: {e}", tmp.display())))?;
     }
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
+    fs::rename(&tmp, path)
+        .map_err(|e| Error::Cache(format!("failed to replace {}: {e}", path.display())))?;
     set_private_permissions(path)?;
     Ok(())
 }
@@ -285,7 +314,7 @@ fn private_open_for_write(path: &Path) -> Result<std::fs::File> {
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+        .map_err(|e| Error::Cache(format!("failed to open {}: {e}", path.display())))
 }
 
 #[cfg(not(unix))]
@@ -295,15 +324,18 @@ fn private_open_for_write(path: &Path) -> Result<std::fs::File> {
         .write(true)
         .truncate(true)
         .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+        .map_err(|e| Error::Cache(format!("failed to open {}: {e}", path.display())))
 }
 
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)?.permissions();
+    let mut permissions = fs::metadata(path)
+        .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", path.display())))?
+        .permissions();
     permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)?;
+    fs::set_permissions(path, permissions)
+        .map_err(|e| Error::Cache(format!("failed to chmod {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -315,13 +347,17 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn ensure_private_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    let mode = fs::metadata(path)
+        .map_err(|e| Error::Cache(format!("failed to stat {}: {e}", path.display())))?
+        .permissions()
+        .mode()
+        & 0o777;
     if mode & 0o077 != 0 {
-        bail!(
+        return Err(Error::Cache(format!(
             "{} has permissions {:04o}; refusing to use cache key unless it is 0600",
             path.display(),
             mode
-        );
+        )));
     }
     Ok(())
 }
@@ -344,15 +380,26 @@ mod tests {
         std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
         let cache = CacheStore::open(&test_cfg()).unwrap();
 
-        let mut secrets = BTreeMap::new();
-        secrets.insert("DATABASE_URL".to_string(), "postgres://secret".to_string());
+        let mut secrets = SecretMap::new();
+        secrets.insert(
+            "DATABASE_URL".to_string(),
+            SecretString::from("postgres://secret".to_string()),
+        );
         cache.store("cdn", &secrets).unwrap();
 
         let body = fs::read(cache.cache_path("cdn")).unwrap();
         assert!(!body
             .windows(b"postgres://secret".len())
             .any(|w| w == b"postgres://secret"));
-        assert_eq!(cache.load("cdn").unwrap(), secrets);
+        assert_eq!(
+            cache
+                .load("cdn")
+                .unwrap()
+                .get("DATABASE_URL")
+                .unwrap()
+                .expose_secret(),
+            "postgres://secret"
+        );
         assert!(cache.load("other-project").is_err());
 
         std::env::remove_var("SECRETS_CACHE_DIR");

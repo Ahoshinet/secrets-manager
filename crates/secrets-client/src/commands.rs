@@ -1,13 +1,12 @@
 //! Implementations of the client subcommands.
 
-use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
-use crate::api::Api;
+use crate::api::{Api, SecretMap};
 
 /// `secrets run` — fetch secrets, inject into the child env, execute.
 ///
@@ -40,11 +39,11 @@ pub fn run(api: &Api, project: &str, command: &[String]) -> Result<i32> {
 
 /// Build the child `Command` with secrets injected as environment
 /// variables. Exposed for testing env-injection behavior.
-pub fn build_command(command: &[String], secrets: &BTreeMap<String, String>) -> Command {
+pub fn build_command(command: &[String], secrets: &SecretMap) -> Command {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     for (k, v) in secrets {
-        cmd.env(k, v);
+        cmd.env(k, v.expose_secret());
     }
     cmd
 }
@@ -55,7 +54,7 @@ pub fn get(api: &Api, project: &str, key: &str) -> Result<i32> {
     match secrets.get(key) {
         Some(value) => {
             let mut out = std::io::stdout();
-            out.write_all(value.as_bytes())?;
+            out.write_all(value.expose_secret().as_bytes())?;
             out.write_all(b"\n")?;
             out.flush()?;
             Ok(0)
@@ -83,7 +82,7 @@ pub fn export(api: &Api, project: &str, format: &str) -> Result<i32> {
     for (k, v) in &secrets {
         out.push_str(k);
         out.push('=');
-        out.push_str(&dotenv_value(v));
+        out.push_str(&dotenv_value(v.expose_secret()));
         out.push('\n');
     }
     print!("{out}");
@@ -103,8 +102,8 @@ pub fn set(api: &Api, project: &str, key: &str) -> Result<i32> {
 /// Interactive terminal -> hidden prompt; piped stdin -> read to EOF.
 fn read_secret_value() -> Result<SecretString> {
     if std::io::stdin().is_terminal() {
-        let entered = rpassword::prompt_password("Value: ")
-            .context("failed to read value from terminal")?;
+        let entered =
+            rpassword::prompt_password("Value: ").context("failed to read value from terminal")?;
         Ok(SecretString::from(entered))
     } else {
         let mut buf = String::new();
@@ -129,9 +128,9 @@ fn read_secret_value() -> Result<SecretString> {
 /// characters, otherwise double-quoted with escaping.
 fn dotenv_value(value: &str) -> String {
     let safe = !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'@'));
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'@')
+        });
     if safe {
         value.to_string()
     } else {
@@ -172,8 +171,11 @@ mod tests {
     #[test]
     fn build_command_injects_env_without_touching_parent() {
         std::env::remove_var("SECRETS_TEST_INJECT");
-        let mut secrets = BTreeMap::new();
-        secrets.insert("SECRETS_TEST_INJECT".to_string(), "value-123".to_string());
+        let mut secrets = SecretMap::new();
+        secrets.insert(
+            "SECRETS_TEST_INJECT".to_string(),
+            SecretString::from("value-123".to_string()),
+        );
 
         // Portable child that echoes the injected variable.
         #[cfg(windows)]

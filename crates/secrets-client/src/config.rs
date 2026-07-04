@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
 use secrecy::SecretString;
 use serde::Deserialize;
+
+use crate::error::{Error, Result};
 
 pub struct Config {
     pub server_url: String,
@@ -29,7 +30,8 @@ pub fn config_path() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("SECRETS_CONFIG") {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| Error::Config("cannot determine home directory".to_string()))?;
     Ok(home.join(".config").join("secrets").join("config.toml"))
 }
 
@@ -38,10 +40,12 @@ pub fn load() -> Result<Config> {
     let path = config_path()?;
     let file: FileConfig = if path.exists() {
         check_permissions(&path);
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Config(format!("failed to read config at {}: {e}", path.display()))
+        })?;
+        toml::from_str(&text).map_err(|e| {
+            Error::Config(format!("failed to parse config at {}: {e}", path.display()))
+        })?
     } else {
         FileConfig::default()
     };
@@ -51,7 +55,10 @@ pub fn load() -> Result<Config> {
         .filter(|s| !s.is_empty())
         .or(file.server_url)
         .ok_or_else(|| {
-            anyhow!("no server_url configured (set it in the config file or SECRETS_SERVER_URL)")
+            Error::Config(
+                "no server_url configured (set it in the config file or SECRETS_SERVER_URL)"
+                    .to_string(),
+            )
         })?;
 
     let token = std::env::var("SECRETS_TOKEN")
@@ -59,7 +66,7 @@ pub fn load() -> Result<Config> {
         .filter(|s| !s.is_empty())
         .or(file.token)
         .ok_or_else(|| {
-            anyhow!("no token configured (set SECRETS_TOKEN or the config file)")
+            Error::Config("no token configured (set SECRETS_TOKEN or the config file)".to_string())
         })?;
 
     Ok(Config {
