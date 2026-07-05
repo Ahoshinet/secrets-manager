@@ -435,6 +435,22 @@ mod tests {
         }
     }
 
+    fn cfg_with(server_url: &str, token: &str) -> Config {
+        Config {
+            server_url: server_url.to_string(),
+            token: SecretString::from(token.to_string()),
+        }
+    }
+
+    fn one_secret() -> SecretMap {
+        let mut secrets = SecretMap::new();
+        secrets.insert(
+            "API_KEY".to_string(),
+            SecretString::from("value".to_string()),
+        );
+        secrets
+    }
+
     #[test]
     fn cache_roundtrip_is_encrypted_and_bound_to_project() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -514,6 +530,92 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
         let err = cache.load("proj").unwrap_err().to_string();
         assert!(err.contains("future"), "unexpected error: {err}");
+
+        std::env::remove_var("SECRETS_CACHE_DIR");
+    }
+
+    #[test]
+    fn expired_cache_past_ttl_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
+        let cache = CacheStore::open(&test_cfg()).unwrap();
+        cache.store("proj", &one_secret()).unwrap();
+
+        // Push the timestamp older than the 24h TTL. The AAD still matches
+        // (we rewrite it), so this exercises the TTL check specifically.
+        let path = cache.cache_path("proj");
+        let mut envelope: Envelope =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope.created_at_unix -= CACHE_TTL.as_secs() + 60;
+        // Re-encrypt under the (older) timestamp so decryption itself would
+        // succeed; only the age check should reject it.
+        let cache2 = CacheStore::open(&test_cfg()).unwrap();
+        let (nonce, ct) = encrypt(
+            &cache2.key,
+            &serde_json::to_vec(&std::collections::BTreeMap::from([("API_KEY", "value")]))
+                .unwrap(),
+            &cache2.aad("proj", envelope.created_at_unix),
+        )
+        .unwrap();
+        envelope.nonce = b64_encode(&nonce);
+        envelope.ciphertext = b64_encode(&ct);
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let err = cache.load("proj").unwrap_err().to_string();
+        assert!(err.contains("expired"), "unexpected error: {err}");
+
+        std::env::remove_var("SECRETS_CACHE_DIR");
+    }
+
+    #[test]
+    fn cache_is_bound_to_token_and_server_url() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
+
+        // Write a cache entry with one identity.
+        let writer = CacheStore::open(&cfg_with("https://a.invalid", "token-a")).unwrap();
+        writer.store("proj", &one_secret()).unwrap();
+        let written_path = writer.cache_path("proj");
+
+        // A different token must not be able to read that entry. Its cache
+        // path differs (token_hash is in the path), so a load simply misses.
+        let other_token = CacheStore::open(&cfg_with("https://a.invalid", "token-b")).unwrap();
+        assert_ne!(other_token.cache_path("proj"), written_path);
+        assert!(other_token.load("proj").is_err());
+
+        // Even if an attacker copies the ciphertext file to the other
+        // identity's path, the AAD (token_hash + server_url) makes the AEAD
+        // reject it.
+        fs::copy(&written_path, other_token.cache_path("proj")).unwrap();
+        assert!(other_token.load("proj").is_err());
+
+        // Same for a different server URL.
+        let other_server = CacheStore::open(&cfg_with("https://b.invalid", "token-a")).unwrap();
+        fs::copy(&written_path, other_server.cache_path("proj")).unwrap();
+        assert!(other_server.load("proj").is_err());
+
+        std::env::remove_var("SECRETS_CACHE_DIR");
+    }
+
+    #[test]
+    fn tampered_ciphertext_in_cache_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SECRETS_CACHE_DIR", tmp.path());
+        let cache = CacheStore::open(&test_cfg()).unwrap();
+        cache.store("proj", &one_secret()).unwrap();
+
+        let path = cache.cache_path("proj");
+        let mut envelope: Envelope =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut ct = b64_decode(&envelope.ciphertext).unwrap();
+        ct[0] ^= 0xFF;
+        envelope.ciphertext = b64_encode(&ct);
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        assert!(cache.load("proj").is_err());
 
         std::env::remove_var("SECRETS_CACHE_DIR");
     }

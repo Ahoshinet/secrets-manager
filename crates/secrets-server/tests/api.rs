@@ -53,6 +53,29 @@ async fn send(
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }
+    send_inner(router, builder, body).await
+}
+
+/// Like [`send`] but the caller supplies the raw `Authorization` header
+/// verbatim, to exercise header-parsing edge cases.
+async fn send_raw_auth(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    auth_header: &str,
+) -> (StatusCode, String) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", auth_header);
+    send_inner(router, builder, None).await
+}
+
+async fn send_inner(
+    router: &Router,
+    builder: axum::http::request::Builder,
+    body: Option<&str>,
+) -> (StatusCode, String) {
     let req = match body {
         Some(b) => builder
             .header("content-type", "application/json")
@@ -371,4 +394,217 @@ async fn oversized_body_is_413() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ---- header-parsing / auth bypass attempts ---------------------------
+
+#[tokio::test]
+async fn lowercase_bearer_scheme_is_rejected() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "real-token", None);
+    // The scheme is case-sensitive by design; anything but `Bearer ` fails.
+    let (status, _) = send_raw_auth(&router, "GET", "/v1/projects", "bearer real-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn empty_bearer_token_is_rejected() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "real-token", None);
+    let (status, _) = send_raw_auth(&router, "GET", "/v1/projects", "Bearer ").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn token_without_scheme_prefix_is_rejected() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "real-token", None);
+    // Presenting the raw token with no `Bearer ` prefix must not authenticate.
+    let (status, _) = send_raw_auth(&router, "GET", "/v1/projects", "real-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn leading_space_in_token_is_rejected() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "real-token", None);
+    // `Bearer  real-token` -> extracted token is ` real-token` (leading
+    // space), which must not match the stored hash.
+    let (status, _) = send_raw_auth(&router, "GET", "/v1/projects", "Bearer  real-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---- scope enforcement -----------------------------------------------
+
+#[tokio::test]
+async fn scoped_token_cannot_create_other_project() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "cdn-only", "tok-cdn", Some("cdn"));
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok-cdn"),
+        Some(r#"{"name":"mcp"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn scoped_token_forbidden_on_existing_other_project() {
+    let (router, db, _tmp) = setup();
+    // Full token provisions a real project the scoped token must not reach.
+    add_token(&db, "admin", "tok-admin", None);
+    add_token(&db, "cdn-only", "tok-cdn", Some("cdn"));
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok-admin"),
+        Some(r#"{"name":"mcp"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 403 must win over any existence check (no project enumeration).
+    let (status, _) =
+        send(&router, "GET", "/v1/projects/mcp/secrets", Some("tok-cdn"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send(
+        &router,
+        "PUT",
+        "/v1/projects/mcp/secrets/KEY",
+        Some("tok-cdn"),
+        Some(r#"{"value":"x"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---- input-validation boundaries -------------------------------------
+
+#[tokio::test]
+async fn project_name_length_boundary() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "tok", None);
+
+    let ok_name = "a".repeat(64);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok"),
+        Some(&format!(r#"{{"name":"{ok_name}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "64-char name should be allowed");
+
+    let too_long = "a".repeat(65);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok"),
+        Some(&format!(r#"{{"name":"{too_long}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "65-char name should be rejected");
+}
+
+#[tokio::test]
+async fn key_name_length_boundary() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "tok", None);
+    let (status, _) = send(&router, "POST", "/v1/projects", Some("tok"), Some(r#"{"name":"p"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let ok_key = "K".repeat(128);
+    let (status, _) = send(
+        &router,
+        "PUT",
+        &format!("/v1/projects/p/secrets/{ok_key}"),
+        Some("tok"),
+        Some(r#"{"value":"v"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "128-char key should be allowed");
+
+    let too_long = "K".repeat(129);
+    let (status, _) = send(
+        &router,
+        "PUT",
+        &format!("/v1/projects/p/secrets/{too_long}"),
+        Some("tok"),
+        Some(r#"{"value":"v"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "129-char key should be rejected");
+}
+
+#[tokio::test]
+async fn missing_value_field_is_400() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "tok", None);
+    let (status, _) = send(&router, "POST", "/v1/projects", Some("tok"), Some(r#"{"name":"p"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Body is valid JSON but missing the required `value` field.
+    let (status, _) = send(
+        &router,
+        "PUT",
+        "/v1/projects/p/secrets/KEY",
+        Some("tok"),
+        Some(r#"{}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn wrong_content_type_is_rejected() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "tok", None);
+    // Deliberately omit the JSON content-type header.
+    let builder = Request::builder()
+        .method("POST")
+        .uri("/v1/projects")
+        .header("authorization", "Bearer tok");
+    let req = builder.body(Body::from(r#"{"name":"p"}"#.to_string())).unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    // axum's Json extractor requires application/json; anything else is a
+    // client error (415/400 depending on version), never a 2xx or 5xx.
+    assert!(
+        res.status().is_client_error(),
+        "expected client error, got {}",
+        res.status()
+    );
+}
+
+#[tokio::test]
+async fn unknown_method_is_405() {
+    let (router, _db, _tmp) = setup();
+    let (status, _) = send(&router, "PATCH", "/v1/projects", None, None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn encoded_slash_in_project_name_is_not_a_bypass() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "dev", "tok", None);
+    // `cdn%2f..%2fmcp` must never be accepted as a valid project name.
+    let (status, _) = send(
+        &router,
+        "GET",
+        "/v1/projects/cdn%2f..%2fmcp/secrets",
+        Some("tok"),
+        None,
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "encoded-slash project name should be a client error, got {status}"
+    );
+    assert_ne!(status, StatusCode::OK);
 }

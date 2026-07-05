@@ -330,4 +330,104 @@ mod tests {
         let key = test_key();
         assert_eq!(format!("{key:?}"), "MasterKey(<redacted>)");
     }
+
+    // ---- randomized tamper / robustness tests ------------------------
+    //
+    // `cargo fuzz` is impractical on the primary (Windows) dev box, so we
+    // approximate coverage with bounded randomized loops over the OS
+    // CSPRNG. These assert the core AEAD guarantee: any mutation of the
+    // ciphertext, nonce, AAD, or key makes decryption fail.
+
+    #[test]
+    fn random_bitflip_in_ciphertext_always_fails() {
+        let key = test_key();
+        let aad = aad_bytes("proj", "KEY");
+        for i in 0..512u32 {
+            let mut pt = [0u8; 32];
+            OsRng.fill_bytes(&mut pt);
+            let (nonce, ct) = encrypt(&key, &pt, &aad).unwrap();
+
+            let mut tampered = ct.clone();
+            let bit = (i as usize) % (tampered.len() * 8);
+            tampered[bit / 8] ^= 1 << (bit % 8);
+            assert!(
+                decrypt(&key, &nonce, &tampered, &aad).is_err(),
+                "flipped ciphertext bit {bit} decrypted"
+            );
+        }
+    }
+
+    #[test]
+    fn random_bitflip_in_nonce_always_fails() {
+        let key = test_key();
+        let aad = aad_bytes("proj", "KEY");
+        for i in 0..NONCE_LEN * 8 {
+            let (nonce, ct) = encrypt(&key, b"payload-under-test", &aad).unwrap();
+            let mut n = nonce.clone();
+            n[i / 8] ^= 1 << (i % 8);
+            assert!(
+                decrypt(&key, &n, &ct, &aad).is_err(),
+                "flipped nonce bit {i} decrypted"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_key_never_decrypts() {
+        let k1 = MasterKey::from_bytes([1u8; KEY_LEN]);
+        let aad = aad_bytes("p", "k");
+        let (nonce, ct) = encrypt(&k1, b"top-secret-material", &aad).unwrap();
+        for b in 0u8..=255 {
+            if b == 1 {
+                continue;
+            }
+            let k2 = MasterKey::from_bytes([b; KEY_LEN]);
+            assert!(decrypt(&k2, &nonce, &ct, &aad).is_err());
+        }
+    }
+
+    #[test]
+    fn random_aad_mutation_is_rejected() {
+        let key = test_key();
+        for _ in 0..256 {
+            let mut a = [0u8; 16];
+            let mut b = [0u8; 16];
+            OsRng.fill_bytes(&mut a);
+            OsRng.fill_bytes(&mut b);
+            let aad = aad_bytes(&hex(&a), &hex(&b));
+            let (nonce, ct) = encrypt(&key, b"x", &aad).unwrap();
+
+            // Any different (project,key) pairing must fail to decrypt.
+            let other = aad_bytes(&hex(&b), &hex(&a));
+            if other != aad {
+                assert!(decrypt(&key, &nonce, &ct, &other).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_large_plaintext_roundtrip() {
+        let key = test_key();
+        let aad = aad_bytes("p", "k");
+        for len in [0usize, 1, 15, 16, 17, 1024, 64 * 1024] {
+            let pt = vec![0xABu8; len];
+            let (nonce, ct) = encrypt(&key, &pt, &aad).unwrap();
+            assert_eq!(decrypt(&key, &nonce, &ct, &aad).unwrap(), pt);
+        }
+    }
+
+    #[test]
+    fn truncated_ciphertext_fails() {
+        let key = test_key();
+        let aad = aad_bytes("p", "k");
+        let (nonce, ct) = encrypt(&key, b"hello world", &aad).unwrap();
+        // Drop the last byte (into the Poly1305 tag) -> auth failure.
+        assert!(decrypt(&key, &nonce, &ct[..ct.len() - 1], &aad).is_err());
+        // Empty ciphertext (shorter than the tag) -> failure, no panic.
+        assert!(decrypt(&key, &nonce, &[], &aad).is_err());
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
