@@ -17,7 +17,7 @@ authors = ["Ahoshinet Groups", "darui3018823"]
 # Cryptography (RustCrypto only — no custom crypto)
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
