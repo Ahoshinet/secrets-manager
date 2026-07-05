@@ -30,9 +30,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects",
             get(handlers::list_projects).post(handlers::create_project),
         )
-        .route("/v1/projects/:name/secrets", get(handlers::get_secrets))
+        .route("/v1/projects/{name}/secrets", get(handlers::get_secrets))
         .route(
-            "/v1/projects/:name/secrets/:key",
+            "/v1/projects/{name}/secrets/{key}",
             put(handlers::put_secret).delete(handlers::delete_secret),
         )
         // Documented API contract: request bodies are capped at 1 MiB

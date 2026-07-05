@@ -17,8 +17,8 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, Key, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -150,13 +150,22 @@ pub fn encrypt(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.expose()));
+    let cipher_key: &Key<XChaCha20Poly1305> = key
+        .expose()
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::Encrypt)?;
+    let cipher = XChaCha20Poly1305::new(cipher_key);
 
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
 
+    let nonce_ref: &XNonce = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::Encrypt)?;
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(nonce_ref, Payload { msg: plaintext, aad })
         .map_err(|_| CryptoError::Encrypt)?;
 
     Ok((nonce.to_vec(), ciphertext))
@@ -173,9 +182,15 @@ pub fn decrypt(
     if nonce.len() != NONCE_LEN {
         return Err(CryptoError::NonceLen);
     }
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.expose()));
+    let cipher_key: &Key<XChaCha20Poly1305> = key
+        .expose()
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::Decrypt)?;
+    let nonce_ref: &XNonce = nonce.try_into().map_err(|_| CryptoError::NonceLen)?;
+    let cipher = XChaCha20Poly1305::new(cipher_key);
     cipher
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(nonce_ref, Payload { msg: ciphertext, aad })
         .map_err(|_| CryptoError::Decrypt)
 }
 

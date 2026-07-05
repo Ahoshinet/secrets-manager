@@ -1,6 +1,7 @@
 //! Bearer-token authentication and scope enforcement.
 
-use axum::async_trait;
+use std::future::Future;
+
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -31,30 +32,34 @@ pub fn resolve_token_name(state: &AppState, headers: &HeaderMap) -> Option<Strin
     token.zeroize();
 
     let conn = state.db.lock().ok()?;
-    repo::authenticate(&conn, &hash).ok().flatten().map(|t| t.name)
+    repo::authenticate(&conn, &hash)
+        .ok()
+        .flatten()
+        .map(|t| t.name)
 }
 
-#[async_trait]
 impl FromRequestParts<AppState> for AuthedToken {
     type Rejection = AppError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let mut token = extract_bearer(&parts.headers).ok_or(AppError::Unauthorized)?;
-        let hash = hash_token(&token);
-        token.zeroize();
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready((|| {
+            let mut token = extract_bearer(&parts.headers).ok_or(AppError::Unauthorized)?;
+            let hash = hash_token(&token);
+            token.zeroize();
 
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Internal("db lock poisoned"))?;
+            let conn = state
+                .db
+                .lock()
+                .map_err(|_| AppError::Internal("db lock poisoned"))?;
 
-        match repo::authenticate(&conn, &hash).map_err(|_| AppError::Internal("database"))? {
-            Some(authed) => Ok(authed),
-            None => Err(AppError::Unauthorized),
-        }
+            match repo::authenticate(&conn, &hash).map_err(|_| AppError::Internal("database"))? {
+                Some(authed) => Ok(authed),
+                None => Err(AppError::Unauthorized),
+            }
+        })())
     }
 }
 

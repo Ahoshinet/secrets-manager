@@ -4,7 +4,6 @@
 //! the `Authorization` header and never placed in the URL or logs.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -37,10 +36,11 @@ impl Api {
     }
 
     fn with_cache(cfg: &Config, cache_enabled: bool) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .into();
         let cache = if cache_enabled {
             match CacheStore::open(cfg) {
                 Ok(cache) => Some(cache),
@@ -102,20 +102,19 @@ impl Api {
         let resp = self
             .agent
             .get(&url)
-            .set("Authorization", &self.auth_header())
+            .header("Authorization", self.auth_header().as_str())
             .call();
 
         match resp {
-            Ok(r) => {
+            Ok(mut r) => {
                 // Bounded read: never trust the server for response size.
-                let mut buf = Zeroizing::new(Vec::new());
-                r.into_reader()
-                    .take(MAX_RESPONSE_BYTES + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|_| Error::UnexpectedResponse)?;
-                if buf.len() as u64 > MAX_RESPONSE_BYTES {
-                    return Err(Error::UnexpectedResponse);
-                }
+                let buf = Zeroizing::new(
+                    r.body_mut()
+                        .with_config()
+                        .limit(MAX_RESPONSE_BYTES)
+                        .read_to_vec()
+                        .map_err(|_| Error::UnexpectedResponse)?,
+                );
                 let raw: BTreeMap<String, String> =
                     serde_json::from_slice(&buf).map_err(|_| Error::UnexpectedResponse)?;
                 secret_map_from_plain(raw)
@@ -141,9 +140,9 @@ impl Api {
         let resp = self
             .agent
             .put(&url)
-            .set("Authorization", &self.auth_header())
-            .set("Content-Type", "application/json")
-            .send_bytes(&body);
+            .header("Authorization", self.auth_header().as_str())
+            .content_type("application/json")
+            .send(body.as_slice());
 
         match resp {
             Ok(_) => {
@@ -160,13 +159,13 @@ impl Api {
 /// Map a ureq error to a clean, non-leaking message.
 fn map_error(e: ureq::Error) -> Error {
     match e {
-        ureq::Error::Status(code, _resp) => match code {
+        ureq::Error::StatusCode(code) => match code {
             401 => Error::Unauthorized,
             403 => Error::Forbidden,
             404 => Error::NotFound,
             _ => Error::Http(code),
         },
-        ureq::Error::Transport(t) => Error::Transport(t.kind().to_string()),
+        _ => Error::Transport(e.to_string()),
     }
 }
 

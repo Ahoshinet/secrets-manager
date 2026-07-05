@@ -344,7 +344,7 @@ async fn audit_logs_token_name_but_not_token_or_secret_value() {
     // The raw path (with the secret key name) must not be logged; only the
     // route template and the project name are.
     assert!(!audit.contains("DATABASE_URL"));
-    assert!(audit.contains("/v1/projects/:name/secrets/:key"));
+    assert!(audit.contains("/v1/projects/{name}/secrets/{key}"));
     assert!(audit.contains(r#""project":"cdn""#));
 }
 

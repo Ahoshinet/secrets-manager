@@ -30,7 +30,7 @@ struct Entry<'a> {
     /// Token *name* only. `None` when the request was unauthenticated.
     token: Option<&'a str>,
     method: &'a str,
-    /// Matched route template (e.g. `/v1/projects/:name/secrets/:key`),
+    /// Matched route template (e.g. `/v1/projects/{name}/secrets/{key}`),
     /// or `(unmatched)` for requests that hit no route. Never the raw path.
     path: &'a str,
     /// Project name extracted from the path for project-scoped routes.
@@ -166,7 +166,7 @@ pub async fn audit_middleware(
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
     let project = match &matched {
-        Some(t) if t.starts_with("/v1/projects/:name") => request
+        Some(t) if t.starts_with("/v1/projects/{name}") => request
             .uri()
             .path()
             .split('/')
