@@ -27,6 +27,8 @@ use crate::error::{Error, Result};
 const CACHE_VERSION: u8 = 2;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const CACHE_AAD_PREFIX: &[u8] = b"secrets-manager-client-cache-v2";
+/// DPAPI secondary-entropy tag; only the Windows cache-key path uses it.
+#[cfg(target_os = "windows")]
 const KEY_ENTROPY: &[u8] = b"secrets-manager-cache-key-v1";
 /// Tolerated forward clock skew when validating `created_at_unix`.
 /// Anything further in the future than this is treated as tampering.
