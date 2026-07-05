@@ -128,6 +128,35 @@ secrets-server serve
 
 ## Deployment
 
+### Scripted install (PowerShell 7+)
+
+The fastest path uses the bundled [`setup.ps1`](setup.ps1) (requires
+[`pwsh`](https://github.com/PowerShell/PowerShell)):
+
+```bash
+# On the VPS, from a checkout, as root:
+sudo pwsh ./setup.ps1 -Domain secrets.example.com
+```
+
+On Linux it builds the release binaries, creates the `secrets` service user,
+installs the binaries to `/usr/local/bin`, **generates a random master
+passphrase** at `/etc/secrets-manager/master-passphrase` (root-only, consumed by
+the systemd credential), installs the hardened unit and the nginx site, and
+opens only ports 80/443 — the app port stays loopback-only. On Windows the same
+script does a local/dev install (build + a per-user passphrase file + run
+instructions). Back up the generated passphrase offline: if it is lost, every
+stored secret is unrecoverable.
+
+To update a running host after pulling new code, use
+[`scripts/rebuild.ps1`](scripts/rebuild.ps1):
+
+```bash
+sudo pwsh ./scripts/rebuild.ps1          # stop → pull → build → reinstall → restart → health check
+sudo pwsh ./scripts/rebuild.ps1 -SkipGit # rebuild the current checkout only
+```
+
+### Manual install
+
 Sample deployment files live under `deploy/`:
 
 - `deploy/systemd/secrets-server.service` runs `secrets-server serve` as a
