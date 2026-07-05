@@ -25,7 +25,7 @@ secrecy = "0.10"
 base64 = "0.22"
 
 # Client
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 url = "2"
 toml = "1.1"
 dirs = "5"
