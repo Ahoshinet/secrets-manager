@@ -15,9 +15,12 @@ permissions:
 jobs:
   cla-check:
     runs-on: ubuntu-latest
+    # Skip bot-authored PRs (e.g. dependabot[bot]): they cannot sign a CLA, and
+    # the action's own allowlist runs only after it tries to initialize the
+    # signatures branch, which fails under a Dependabot read-only token.
     if: |
       (github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
-      github.event_name == 'pull_request_target'
+      (github.event_name == 'pull_request_target' && !endsWith(github.actor, '[bot]'))
     steps:
       - name: CLA Assistant
         uses: contributor-assistant/github-action@v2.6.1
