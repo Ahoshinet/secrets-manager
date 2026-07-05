@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "BSD-2-Clause"
+license = "AGPL-3.0-or-later"
 authors = ["Ahoshinet Groups", "darui3018823"]
 
 [workspace.dependencies]

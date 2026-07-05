@@ -276,4 +276,23 @@ defer databaseURL.Zeroize()
 
 ## License
 
-BSD 2-Clause. See [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`). See
+[LICENSE](LICENSE) for the full text.
+
+Copyright (c) 2026 Ahoshinet Groups
+Copyright (c) 2026 darui3018823
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. It is distributed WITHOUT ANY WARRANTY; see the license for
+details.
+
+The AGPL's network-use clause (section 13) applies: if you run a modified
+version of the server to provide a service over a network, you must offer the
+corresponding source of your modified version to its users.
+
+> Note: the separate Go client lives in its own repository
+> (`Ahoshinet/secrets-manager-go`) under BSD-2-Clause. It communicates with the
+> server only over HTTP as an independent program, so the server's AGPL terms
+> do not extend to it.
