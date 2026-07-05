@@ -274,6 +274,15 @@ defer databaseURL.Zeroize()
   loopback, TLS at nginx, and the master passphrase supplied through a private
   file or systemd credential.
 
+## Contributing
+
+Contributions are welcome. Before a pull request can be merged, you must sign
+the [Contributor License Agreement](CLA.md) by commenting the phrase shown in
+the PR prompt. The CLA grants Ahoshinet Groups a dual-licensing right so the
+project can enforce AGPLv3 copyleft while retaining the option to offer
+alternative licensing terms. Signing is automated via the CLA Assistant
+workflow.
+
 ## License
 
 GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`). See
