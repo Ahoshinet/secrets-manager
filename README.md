@@ -147,6 +147,12 @@ script does a local/dev install (build + a per-user passphrase file + run
 instructions). Back up the generated passphrase offline: if it is lost, every
 stored secret is unrecoverable.
 
+The nginx install expects TLS certificate files to already exist. By default it
+uses `/etc/letsencrypt/live/<domain>/fullchain.pem` and
+`/etc/letsencrypt/live/<domain>/privkey.pem`; pass `-SSLCertPath` and
+`-SSLKeyPath` for custom locations, or use `-SkipNginx` until certificates are
+provisioned.
+
 To update a running host after pulling new code, use
 [`scripts/rebuild.ps1`](scripts/rebuild.ps1):
 

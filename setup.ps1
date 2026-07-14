@@ -198,11 +198,26 @@ function Install-Nginx {
         Write-Note "nginx not installed; installing..."
         & apt-get update; & apt-get install -y nginx
     }
+    $certPath = if ($SSLCertPath) { $SSLCertPath } else { "/etc/letsencrypt/live/$Domain/fullchain.pem" }
+    $keyPath = if ($SSLKeyPath) { $SSLKeyPath } else { "/etc/letsencrypt/live/$Domain/privkey.pem" }
+    if (-not (Test-Path $certPath) -or -not (Test-Path $keyPath)) {
+        Write-Err "TLS certificate files were not found for nginx:"
+        Write-Err "  certificate: $certPath"
+        Write-Err "  private key: $keyPath"
+        $enabled = "/etc/nginx/sites-enabled/$Domain"
+        if (Test-Path $enabled) {
+            Write-Note "An existing enabled nginx site may still reference missing certs: $enabled"
+        }
+        Write-Note "Use your real -Domain, provision the certificate first, or pass -SSLCertPath/-SSLKeyPath."
+        Write-Note "To install the server without nginx for now, re-run with -SkipNginx."
+        throw "nginx TLS certificate is missing"
+    }
+
     $confSrc = Join-Path $script:ProjectRoot "deploy/nginx/secrets-manager.conf"
     $conf = Get-Content $confSrc -Raw
     $conf = $conf -replace "secrets\.example\.com", $Domain
-    if ($SSLCertPath) { $conf = $conf -replace "ssl_certificate\s+\S+;", "ssl_certificate $SSLCertPath;" }
-    if ($SSLKeyPath)  { $conf = $conf -replace "ssl_certificate_key\s+\S+;", "ssl_certificate_key $SSLKeyPath;" }
+    $conf = $conf -replace "ssl_certificate\s+\S+;", "ssl_certificate $certPath;"
+    $conf = $conf -replace "ssl_certificate_key\s+\S+;", "ssl_certificate_key $keyPath;"
     if ($script:Bind -ne "127.0.0.1:8787") { $conf = $conf -replace "127\.0\.0\.1:8787", $script:Bind }
 
     $avail = "/etc/nginx/sites-available/$Domain"
