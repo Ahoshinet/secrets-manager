@@ -7,19 +7,19 @@
 
 use std::collections::BTreeMap;
 
+use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use secrecy::{ExposeSecret, SecretString};
-use secrets_crypto::{aad_bytes, decrypt, encrypt};
+use secrets_crypto::{aad_bytes, decrypt, encrypt, generate_token, hash_token};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 use crate::app::AppState;
-use crate::auth::ensure_scope;
+use crate::auth::{ensure_admin, ensure_scope};
 use crate::error::AppError;
 use crate::repo::{self, AuthedToken};
 
@@ -188,4 +188,110 @@ pub async fn delete_secret(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+#[derive(Deserialize)]
+pub struct CreateTokenBody {
+    name: String,
+    project: Option<String>,
+    ttl_days: Option<u32>,
+    #[serde(default)]
+    no_expiry: bool,
+}
+
+pub async fn create_token(
+    State(state): State<AppState>,
+    token: AuthedToken,
+    body: Result<Json<CreateTokenBody>, JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_admin(&token)?;
+
+    let Json(body) = body.map_err(map_json_rejection)?;
+    if !valid_project(&body.name) {
+        return Err(AppError::BadRequest("invalid token name"));
+    }
+    if let Some(project) = &body.project {
+        if !valid_project(project) {
+            return Err(AppError::BadRequest("invalid project scope name"));
+        }
+    }
+    if body.no_expiry && body.ttl_days.is_some() {
+        return Err(AppError::BadRequest(
+            "ttl_days cannot be used with no_expiry",
+        ));
+    }
+
+    let expires_at = if body.no_expiry {
+        None
+    } else {
+        let days = body.ttl_days.unwrap_or(90);
+        if days == 0 {
+            return Err(AppError::BadRequest("ttl_days must be at least 1"));
+        }
+        Some(
+            (time::OffsetDateTime::now_utc() + time::Duration::days(i64::from(days)))
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| AppError::Internal("format token expiry"))?,
+        )
+    };
+
+    let new_token = generate_token();
+    let token_hash = hash_token(new_token.expose_secret());
+    {
+        let conn = state.db.lock().map_err(|_| AppError::Internal("db lock"))?;
+        repo::insert_token(
+            &conn,
+            &body.name,
+            &token_hash,
+            body.project.as_deref(),
+            expires_at.as_deref(),
+        )?;
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "name": body.name,
+            "scope": body.project,
+            "expires_at": expires_at,
+            "token": new_token.expose_secret(),
+        })),
+    ))
+}
+
+pub async fn list_tokens(
+    State(state): State<AppState>,
+    token: AuthedToken,
+) -> Result<Json<Value>, AppError> {
+    ensure_admin(&token)?;
+
+    let conn = state.db.lock().map_err(|_| AppError::Internal("db lock"))?;
+    let tokens: Vec<Value> = repo::list_tokens(&conn)?
+        .into_iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "scope": t.scope,
+                "created_at": t.created_at,
+                "expires_at": t.expires_at,
+                "revoked": t.revoked,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "tokens": tokens })))
+}
+
+pub async fn revoke_token(
+    State(state): State<AppState>,
+    token: AuthedToken,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    ensure_admin(&token)?;
+    if !valid_project(&name) {
+        return Err(AppError::BadRequest("invalid token name"));
+    }
+
+    let conn = state.db.lock().map_err(|_| AppError::Internal("db lock"))?;
+    let revoked = repo::revoke_token(&conn, &name)?;
+    Ok(Json(json!({ "revoked": revoked })))
 }

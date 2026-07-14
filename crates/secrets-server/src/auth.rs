@@ -3,9 +3,9 @@
 use std::future::Future;
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::HeaderMap;
 use secrets_crypto::hash_token;
 use zeroize::Zeroize;
 
@@ -69,5 +69,14 @@ pub fn ensure_scope(token: &AuthedToken, project: &str) -> Result<(), AppError> 
     match &token.scope {
         Some(s) if s != project => Err(AppError::Forbidden),
         _ => Ok(()),
+    }
+}
+
+/// Only unscoped tokens can perform administrative operations.
+pub fn ensure_admin(token: &AuthedToken) -> Result<(), AppError> {
+    if token.scope.is_some() {
+        Err(AppError::Forbidden)
+    } else {
+        Ok(())
     }
 }

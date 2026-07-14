@@ -207,6 +207,9 @@ archive contains static Linux binaries plus the deploy samples.
 | GET | `/v1/projects/{name}/secrets` | decrypted `{key: value}` map |
 | PUT | `/v1/projects/{name}/secrets/{key}` | set — body `{"value":"..."}` |
 | DELETE | `/v1/projects/{name}/secrets/{key}` | delete |
+| GET | `/v1/tokens` | list token metadata (admin token only) |
+| POST | `/v1/tokens` | issue token (admin token only; token returned once) |
+| DELETE | `/v1/tokens/{name}` | revoke active tokens by name (admin token only) |
 
 A token scoped to a project returns **403** for any other project; revoked or
 invalid tokens return **401**.
@@ -238,6 +241,11 @@ secrets set  --project cdn DATABASE_URL     # value read from stdin/hidden promp
 secrets get  --project cdn DATABASE_URL     # single value to stdout
 secrets list --project cdn                  # key names only
 secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-in)
+
+# Admin token only: issue/revoke tokens remotely.
+secrets token create --name windows --project cdn
+secrets token list
+secrets token revoke --name windows
 ```
 
 - `set` never takes the value on the command line (it would leak via `ps` /
@@ -252,6 +260,8 @@ secrets export --project cdn --format dotenv   # dotenv to stdout (explicit opt-
 - If the server is unreachable, `run` / `get` / `list` / `export` fall back to a
   fresh encrypted cache entry and print a warning to stderr. Auth failures and
   HTTP errors do not use the cache.
+- `secrets token ...` commands require an unscoped/admin token. The created
+  token is printed once; store it immediately.
 
 > Projects are provisioned via `POST /v1/projects` (admin/API); the client has
 > no project-create command.

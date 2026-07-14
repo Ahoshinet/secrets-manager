@@ -3,7 +3,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::api::{Api, SecretMap};
@@ -99,6 +99,60 @@ pub fn set(api: &Api, project: &str, key: &str) -> Result<i32> {
     let value = read_secret_value()?;
     api.set_secret(project, key, &value)?;
     eprintln!("set `{key}` in project `{project}`");
+    Ok(0)
+}
+
+/// `secrets token create` — issue a token through the remote admin API.
+pub fn token_create(
+    api: &Api,
+    name: &str,
+    project: Option<&str>,
+    ttl_days: Option<u32>,
+    no_expiry: bool,
+) -> Result<i32> {
+    let created = api.create_token(name, project, ttl_days, no_expiry)?;
+    println!("Token created (name: {}).", created.name);
+    match &created.scope {
+        Some(scope) => println!("Scope: project '{scope}'"),
+        None => println!("Scope: all projects"),
+    }
+    match &created.expires_at {
+        Some(expires_at) => println!("Expires: {expires_at}"),
+        None => println!("Expires: never (revoke manually when no longer needed)"),
+    }
+    println!("Store it now - it is shown only once:");
+    println!("{}", created.token.expose_secret());
+    Ok(0)
+}
+
+/// `secrets token list` — print token metadata only.
+pub fn token_list(api: &Api) -> Result<i32> {
+    let tokens = api.list_tokens()?;
+    if tokens.is_empty() {
+        println!("(no tokens)");
+        return Ok(0);
+    }
+    println!(
+        "{:<20} {:<16} {:<26} {:<26} REVOKED",
+        "NAME", "SCOPE", "CREATED", "EXPIRES"
+    );
+    for token in tokens {
+        println!(
+            "{:<20} {:<16} {:<26} {:<26} {}",
+            token.name,
+            token.scope.as_deref().unwrap_or("(all)"),
+            token.created_at,
+            token.expires_at.as_deref().unwrap_or("(never)"),
+            if token.revoked { "yes" } else { "no" }
+        );
+    }
+    Ok(0)
+}
+
+/// `secrets token revoke` — revoke all active tokens with a name.
+pub fn token_revoke(api: &Api, name: &str) -> Result<i32> {
+    let revoked = api.revoke_token(name)?;
+    println!("Revoked {revoked} token(s) named '{name}'.");
     Ok(0)
 }
 

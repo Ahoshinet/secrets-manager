@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::cache::CacheStore;
@@ -14,6 +15,22 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 
 pub type SecretMap = BTreeMap<String, SecretString>;
+
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub name: String,
+    pub scope: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked: bool,
+}
+
+pub struct CreatedToken {
+    pub name: String,
+    pub scope: Option<String>,
+    pub expires_at: Option<String>,
+    pub token: SecretString,
+}
 
 /// Hard cap on response bodies read from the server. A hostile or
 /// compromised server must not be able to exhaust client memory.
@@ -154,6 +171,143 @@ impl Api {
             Err(e) => Err(map_error(e)),
         }
     }
+
+    /// Issue a new access token. Requires an unscoped/admin token.
+    pub fn create_token(
+        &self,
+        name: &str,
+        project: Option<&str>,
+        ttl_days: Option<u32>,
+        no_expiry: bool,
+    ) -> Result<CreatedToken> {
+        #[derive(serde::Serialize)]
+        struct CreateTokenBody<'a> {
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            project: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl_days: Option<u32>,
+            no_expiry: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct CreatedTokenWire {
+            name: String,
+            scope: Option<String>,
+            expires_at: Option<String>,
+            token: String,
+        }
+
+        let body = Zeroizing::new(
+            serde_json::to_vec(&CreateTokenBody {
+                name,
+                project,
+                ttl_days,
+                no_expiry,
+            })
+            .map_err(|_| Error::UnexpectedResponse)?,
+        );
+        let url = format!("{}/v1/tokens", self.base);
+        let resp = self
+            .agent
+            .post(&url)
+            .header("Authorization", self.auth_header().as_str())
+            .content_type("application/json")
+            .send(body.as_slice());
+
+        match resp {
+            Ok(r) => {
+                let out: CreatedTokenWire = read_json(r)?;
+                Ok(CreatedToken {
+                    name: out.name,
+                    scope: out.scope,
+                    expires_at: out.expires_at,
+                    token: SecretString::from(out.token),
+                })
+            }
+            Err(e) => Err(map_error(e)),
+        }
+    }
+
+    /// List access tokens by metadata only. Token hashes and plaintext tokens
+    /// are never returned by the server.
+    pub fn list_tokens(&self) -> Result<Vec<TokenInfo>> {
+        #[derive(Deserialize)]
+        struct ListTokensWire {
+            tokens: Vec<TokenInfoWire>,
+        }
+        #[derive(Deserialize)]
+        struct TokenInfoWire {
+            name: String,
+            scope: Option<String>,
+            created_at: String,
+            expires_at: Option<String>,
+            revoked: bool,
+        }
+
+        let url = format!("{}/v1/tokens", self.base);
+        let resp = self
+            .agent
+            .get(&url)
+            .header("Authorization", self.auth_header().as_str())
+            .call();
+
+        match resp {
+            Ok(r) => {
+                let out: ListTokensWire = read_json(r)?;
+                Ok(out
+                    .tokens
+                    .into_iter()
+                    .map(|t| TokenInfo {
+                        name: t.name,
+                        scope: t.scope,
+                        created_at: t.created_at,
+                        expires_at: t.expires_at,
+                        revoked: t.revoked,
+                    })
+                    .collect())
+            }
+            Err(e) => Err(map_error(e)),
+        }
+    }
+
+    /// Revoke all active tokens with the given name. Requires an
+    /// unscoped/admin token.
+    pub fn revoke_token(&self, name: &str) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct RevokeTokenWire {
+            revoked: usize,
+        }
+
+        let url = format!("{}/v1/tokens/{}", self.base, name);
+        let resp = self
+            .agent
+            .delete(&url)
+            .header("Authorization", self.auth_header().as_str())
+            .call();
+
+        match resp {
+            Ok(r) => {
+                let out: RevokeTokenWire = read_json(r)?;
+                Ok(out.revoked)
+            }
+            Err(e) => Err(map_error(e)),
+        }
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<T> {
+    let buf = Zeroizing::new(
+        response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_to_vec()
+            .map_err(|_| Error::UnexpectedResponse)?,
+    );
+    serde_json::from_slice(&buf).map_err(|_| Error::UnexpectedResponse)
 }
 
 /// Map a ureq error to a clean, non-leaking message.

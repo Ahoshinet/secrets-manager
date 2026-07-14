@@ -18,6 +18,8 @@ track it.
 - A token may be **scoped** to a single project. A scoped token accessing any
   other project receives `403`. `GET /v1/projects` returns only the scoped
   project for such tokens.
+- An unscoped token is an **admin token**. Token management endpoints require an
+  admin token and return `403` for scoped tokens.
 - Request and response bodies are JSON (`Content-Type: application/json`).
   The server caps request bodies at **1 MiB** (larger is `413`); clients cap
   response reads at 1 MiB.
@@ -29,6 +31,7 @@ track it.
 | Field | Rule |
 |---|---|
 | project name | non-empty, ≤ 64 bytes, `[A-Za-z0-9_-]` only |
+| token name | non-empty, ≤ 64 bytes, `[A-Za-z0-9_-]` only |
 | secret key | non-empty, ≤ 128 bytes, `[A-Za-z0-9_.-]` only |
 
 Violations return `400`.
@@ -38,9 +41,9 @@ Violations return `400`.
 | Code | Meaning |
 |---|---|
 | 200 | OK (body follows) |
-| 201 | Created (project) |
-| 204 | No Content (delete) |
-| 400 | Bad Request (invalid project/key name, malformed/invalid JSON body) |
+| 201 | Created (project or token) |
+| 204 | No Content |
+| 400 | Bad Request (invalid name, malformed/invalid JSON body) |
 | 401 | Unauthorized (missing/invalid/revoked/expired token) |
 | 403 | Forbidden (token not scoped to this project) |
 | 404 | Not Found (unknown project or key; the name itself was valid) |
@@ -117,6 +120,62 @@ version of that key.
 ```
 
 `404` if the project or key does not exist.
+
+### `GET /v1/tokens` — list tokens
+
+Requires an admin token. The response never includes plaintext tokens or token
+hashes.
+
+```json
+200 OK
+{
+  "tokens": [
+    {
+      "name": "ci",
+      "scope": "app",
+      "created_at": "2026-07-15T00:00:00Z",
+      "expires_at": "2026-10-13T00:00:00Z",
+      "revoked": false
+    }
+  ]
+}
+```
+
+`403` if the caller uses a scoped token.
+
+### `POST /v1/tokens` — issue a token
+
+Requires an admin token. The plaintext token is returned once in the response
+and is never stored by the server.
+
+```json
+// request
+{ "name": "windows", "project": "app", "ttl_days": 90 }
+
+201 Created
+{
+  "name": "windows",
+  "scope": "app",
+  "expires_at": "2026-10-13T00:00:00Z",
+  "token": "shown-once"
+}
+```
+
+Omit `project` for an admin token. Use `"no_expiry": true` instead of
+`ttl_days` for a token without expiry. Returns `400` for invalid names or TTL,
+and `403` if the caller uses a scoped token.
+
+### `DELETE /v1/tokens/{name}` — revoke tokens
+
+Requires an admin token. Revokes all active tokens with the given name.
+
+```json
+200 OK
+{ "revoked": 1 }
+```
+
+Returns `400` for an invalid token name and `403` if the caller uses a scoped
+token.
 
 ## Notes for client authors
 

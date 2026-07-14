@@ -6,10 +6,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use secrets_crypto::{hash_token, MasterKey};
+use secrets_crypto::{MasterKey, hash_token};
 use secrets_server::app::{self, AppState};
 use secrets_server::audit::AuditLog;
 use secrets_server::{db, repo};
@@ -86,7 +86,9 @@ async fn send_inner(
 
     let res = router.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -155,8 +157,14 @@ async fn scoped_token_forbidden_on_other_project() {
     let (router, db, _tmp) = setup();
     add_token(&db, "cdn-only", "tok-cdn", Some("cdn"));
     // Accessing a different project must be 403 regardless of existence.
-    let (status, _) =
-        send(&router, "GET", "/v1/projects/mcp/secrets", Some("tok-cdn"), None).await;
+    let (status, _) = send(
+        &router,
+        "GET",
+        "/v1/projects/mcp/secrets",
+        Some("tok-cdn"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -175,9 +183,93 @@ async fn scoped_token_allowed_on_own_project() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, _) =
-        send(&router, "GET", "/v1/projects/cdn/secrets", Some("tok-cdn"), None).await;
+    let (status, _) = send(
+        &router,
+        "GET",
+        "/v1/projects/cdn/secrets",
+        Some("tok-cdn"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_token_can_create_remote_token() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "admin", "admin-token", None);
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/tokens",
+        Some("admin-token"),
+        Some(r#"{"name":"windows","project":"app","ttl_days":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["name"], "windows");
+    assert_eq!(value["scope"], "app");
+    let issued = value["token"]
+        .as_str()
+        .expect("token should be returned once");
+    assert!(!issued.is_empty());
+
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some(issued),
+        Some(r#"{"name":"app"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn scoped_token_cannot_create_remote_token() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "app", "app-token", Some("app"));
+
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/tokens",
+        Some("app-token"),
+        Some(r#"{"name":"other"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_token_can_list_and_revoke_remote_tokens() {
+    let (router, db, _tmp) = setup();
+    add_token(&db, "admin", "admin-token", None);
+    add_token(&db, "worker", "worker-token", Some("app"));
+
+    let (status, body) = send(&router, "GET", "/v1/tokens", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("admin"));
+    assert!(body.contains("worker"));
+    assert!(!body.contains("admin-token"));
+    assert!(!body.contains("worker-token"));
+
+    let (status, body) = send(
+        &router,
+        "DELETE",
+        "/v1/tokens/worker",
+        Some("admin-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"revoked\":1"));
+
+    let (status, _) = send(&router, "GET", "/v1/projects", Some("worker-token"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -236,10 +328,19 @@ async fn full_crud_roundtrip_and_ciphertext_at_rest() {
     assert!(body.contains("\"version\":1"));
 
     // Read it back — value must match.
-    let (status, body) =
-        send(&router, "GET", "/v1/projects/cdn/secrets", Some("tok"), None).await;
+    let (status, body) = send(
+        &router,
+        "GET",
+        "/v1/projects/cdn/secrets",
+        Some("tok"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains(secret_value), "value roundtrip failed: {body}");
+    assert!(
+        body.contains(secret_value),
+        "value roundtrip failed: {body}"
+    );
 
     // At rest, the ciphertext must NOT contain the plaintext.
     {
@@ -278,8 +379,14 @@ async fn full_crud_roundtrip_and_ciphertext_at_rest() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Now gone.
-    let (status, body) =
-        send(&router, "GET", "/v1/projects/cdn/secrets", Some("tok"), None).await;
+    let (status, body) = send(
+        &router,
+        "GET",
+        "/v1/projects/cdn/secrets",
+        Some("tok"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("DATABASE_URL"));
 
@@ -354,7 +461,14 @@ async fn invalid_project_name_is_400_not_404() {
     add_token(&db, "tok", "raw", None);
 
     // '!' is outside the allowed project-name alphabet.
-    let (status, _) = send(&router, "GET", "/v1/projects/bad%21name/secrets", Some("raw"), None).await;
+    let (status, _) = send(
+        &router,
+        "GET",
+        "/v1/projects/bad%21name/secrets",
+        Some("raw"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, _) = send(
@@ -373,7 +487,14 @@ async fn malformed_json_is_400() {
     let (router, db, _tmp) = setup();
     add_token(&db, "tok", "raw", None);
 
-    let (status, _) = send(&router, "POST", "/v1/projects", Some("raw"), Some("{not json")).await;
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("raw"),
+        Some("{not json"),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -381,7 +502,14 @@ async fn malformed_json_is_400() {
 async fn oversized_body_is_413() {
     let (router, db, _tmp) = setup();
     add_token(&db, "tok", "raw", None);
-    let (status, _) = send(&router, "POST", "/v1/projects", Some("raw"), Some(r#"{"name":"cdn"}"#)).await;
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("raw"),
+        Some(r#"{"name":"cdn"}"#),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     let big = format!(r#"{{"value":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
@@ -468,8 +596,14 @@ async fn scoped_token_forbidden_on_existing_other_project() {
     assert_eq!(status, StatusCode::CREATED);
 
     // 403 must win over any existence check (no project enumeration).
-    let (status, _) =
-        send(&router, "GET", "/v1/projects/mcp/secrets", Some("tok-cdn"), None).await;
+    let (status, _) = send(
+        &router,
+        "GET",
+        "/v1/projects/mcp/secrets",
+        Some("tok-cdn"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let (status, _) = send(
@@ -499,7 +633,11 @@ async fn project_name_length_boundary() {
         Some(&format!(r#"{{"name":"{ok_name}"}}"#)),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "64-char name should be allowed");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "64-char name should be allowed"
+    );
 
     let too_long = "a".repeat(65);
     let (status, _) = send(
@@ -510,14 +648,25 @@ async fn project_name_length_boundary() {
         Some(&format!(r#"{{"name":"{too_long}"}}"#)),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "65-char name should be rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "65-char name should be rejected"
+    );
 }
 
 #[tokio::test]
 async fn key_name_length_boundary() {
     let (router, db, _tmp) = setup();
     add_token(&db, "dev", "tok", None);
-    let (status, _) = send(&router, "POST", "/v1/projects", Some("tok"), Some(r#"{"name":"p"}"#)).await;
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok"),
+        Some(r#"{"name":"p"}"#),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     let ok_key = "K".repeat(128);
@@ -540,14 +689,25 @@ async fn key_name_length_boundary() {
         Some(r#"{"value":"v"}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "129-char key should be rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "129-char key should be rejected"
+    );
 }
 
 #[tokio::test]
 async fn missing_value_field_is_400() {
     let (router, db, _tmp) = setup();
     add_token(&db, "dev", "tok", None);
-    let (status, _) = send(&router, "POST", "/v1/projects", Some("tok"), Some(r#"{"name":"p"}"#)).await;
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/projects",
+        Some("tok"),
+        Some(r#"{"name":"p"}"#),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     // Body is valid JSON but missing the required `value` field.
@@ -571,7 +731,9 @@ async fn wrong_content_type_is_rejected() {
         .method("POST")
         .uri("/v1/projects")
         .header("authorization", "Bearer tok");
-    let req = builder.body(Body::from(r#"{"name":"p"}"#.to_string())).unwrap();
+    let req = builder
+        .body(Body::from(r#"{"name":"p"}"#.to_string()))
+        .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     // axum's Json extractor requires application/json; anything else is a
     // client error (415/400 depending on version), never a 2xx or 5xx.

@@ -62,6 +62,36 @@ pub enum Command {
         #[arg(long, default_value = "dotenv")]
         format: String,
     },
+    /// Manage access tokens through the remote server API.
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TokenCmd {
+    /// Issue a new token. The value is printed once and never stored.
+    Create {
+        #[arg(long)]
+        name: String,
+        /// Restrict the token to a single project (omit for all projects).
+        #[arg(long)]
+        project: Option<String>,
+        /// Days until the token expires.
+        #[arg(long, default_value_t = 90, conflicts_with = "no_expiry")]
+        ttl_days: u32,
+        /// Issue a token that never expires (requires manual revocation).
+        #[arg(long)]
+        no_expiry: bool,
+    },
+    /// Revoke all active tokens with the given name.
+    Revoke {
+        #[arg(long)]
+        name: String,
+    },
+    /// List tokens (names/scopes only; never the token or its hash).
+    List,
 }
 
 impl Command {
@@ -71,7 +101,7 @@ impl Command {
             | Command::Get { no_cache, .. }
             | Command::List { no_cache, .. }
             | Command::Export { no_cache, .. } => *no_cache,
-            Command::Set { .. } => false,
+            Command::Set { .. } | Command::Token { .. } => false,
         }
     }
 }

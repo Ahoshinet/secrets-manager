@@ -2,10 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
-use axum::routing::{get, put};
-use axum::Router;
+use axum::routing::{delete, get, put};
 use rusqlite::Connection;
 use secrets_crypto::MasterKey;
 
@@ -35,6 +35,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/{name}/secrets/{key}",
             put(handlers::put_secret).delete(handlers::delete_secret),
         )
+        .route(
+            "/v1/tokens",
+            get(handlers::list_tokens).post(handlers::create_token),
+        )
+        .route("/v1/tokens/{name}", delete(handlers::revoke_token))
         // Documented API contract: request bodies are capped at 1 MiB
         // (matches the clients' response-read cap). Exceeding it is 413.
         .layer(DefaultBodyLimit::max(1024 * 1024))

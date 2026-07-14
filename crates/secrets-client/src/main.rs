@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use secrets_client::api::Api;
-use secrets_client::cli::{Cli, Command};
+use secrets_client::cli::{Cli, Command, TokenCmd};
 use secrets_client::{commands, config};
 
 fn dispatch(cli: Cli) -> Result<i32> {
@@ -30,6 +30,22 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Export {
             project, format, ..
         } => commands::export(&api, &project, &format),
+        Command::Token { cmd } => match cmd {
+            TokenCmd::Create {
+                name,
+                project,
+                ttl_days,
+                no_expiry,
+            } => commands::token_create(
+                &api,
+                &name,
+                project.as_deref(),
+                (!no_expiry).then_some(ttl_days),
+                no_expiry,
+            ),
+            TokenCmd::Revoke { name } => commands::token_revoke(&api, &name),
+            TokenCmd::List => commands::token_list(&api),
+        },
     }
 }
 
