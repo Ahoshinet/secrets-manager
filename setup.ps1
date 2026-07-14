@@ -198,6 +198,8 @@ function Install-Nginx {
         Write-Note "nginx not installed; installing..."
         & apt-get update; & apt-get install -y nginx
     }
+    Remove-StaleNginxPlaceholderSite
+
     $certPath = if ($SSLCertPath) { $SSLCertPath } else { "/etc/letsencrypt/live/$Domain/fullchain.pem" }
     $keyPath = if ($SSLKeyPath) { $SSLKeyPath } else { "/etc/letsencrypt/live/$Domain/privkey.pem" }
     if (-not (Test-Path $certPath) -or -not (Test-Path $keyPath)) {
@@ -229,10 +231,23 @@ function Install-Nginx {
     & nginx -t
     if ($LASTEXITCODE -ne 0) {
         Write-Err "nginx config test failed. Fix certs/domain in $avail, then: nginx -t && systemctl reload nginx"
-        return
+        throw "nginx config test failed"
     }
     & systemctl reload nginx; Assert-Exit "nginx reload"
     Write-Info "nginx reloaded."
+}
+
+function Remove-StaleNginxPlaceholderSite {
+    if ($Domain -eq "secrets.example.com") { return }
+
+    $placeholderEnabled = "/etc/nginx/sites-enabled/secrets.example.com"
+
+    & test -L $placeholderEnabled
+    $isSymlink = ($LASTEXITCODE -eq 0)
+    if ($isSymlink) {
+        & rm -f $placeholderEnabled; Assert-Exit "remove stale placeholder nginx site"
+        Write-Note "Removed stale placeholder nginx site: $placeholderEnabled"
+    }
 }
 
 function Configure-Firewall {
