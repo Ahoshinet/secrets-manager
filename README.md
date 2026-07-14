@@ -138,6 +138,13 @@ The fastest path uses the bundled [`setup.ps1`](setup.ps1) (requires
 sudo pwsh ./setup.ps1 -Domain secrets.example.com
 ```
 
+For a Cloudflare Origin Certificate style setup, the quick start uses
+`/etc/ssl/certs/cf.crt` and `/etc/ssl/private/cf.key` by default:
+
+```bash
+sudo pwsh ./scripts/quick-start.ps1 -Domain secrets-manager.example.com
+```
+
 On Linux it builds the release binaries, creates the `secrets` service user,
 installs the binaries to `/usr/local/bin`, **generates a random master
 passphrase** at `/etc/secrets-manager/master-passphrase` (root-only, consumed by
