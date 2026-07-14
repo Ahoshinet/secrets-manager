@@ -80,17 +80,17 @@ Write-Info "Quick-starting Secrets Manager for https://$Domain"
 Write-Info "Using nginx TLS certificate: $SSLCertPath"
 Write-Info "Using nginx TLS private key: $SSLKeyPath"
 
-$setupArgs = @(
-    "-Domain", $Domain,
-    "-Port", "$Port",
-    "-SSLCertPath", $SSLCertPath,
-    "-SSLKeyPath", $SSLKeyPath,
-    "-InstallPrefix", $InstallPrefix
-)
+$setupArgs = @{
+    Domain = $Domain
+    Port = $Port
+    SSLCertPath = $SSLCertPath
+    SSLKeyPath = $SSLKeyPath
+    InstallPrefix = $InstallPrefix
+}
 
-if ($SkipBuild) { $setupArgs += "-SkipBuild" }
-if ($SkipService) { $setupArgs += "-SkipService" }
-if ($SkipNginx) { $setupArgs += "-SkipNginx" }
-if ($Force) { $setupArgs += "-Force" }
+if ($SkipBuild) { $setupArgs.SkipBuild = $true }
+if ($SkipService) { $setupArgs.SkipService = $true }
+if ($SkipNginx) { $setupArgs.SkipNginx = $true }
+if ($Force) { $setupArgs.Force = $true }
 
 & $setup @setupArgs
