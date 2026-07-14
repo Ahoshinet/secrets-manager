@@ -69,11 +69,19 @@ pub fn acquire_passphrase() -> Result<SecretString> {
         if path.as_os_str().is_empty() {
             bail!("SECRETS_PASSPHRASE_FILE is set but empty");
         }
-        return read_passphrase_file(&path, "SECRETS_PASSPHRASE_FILE");
+        return read_passphrase_file(
+            &path,
+            "SECRETS_PASSPHRASE_FILE",
+            PassphraseFileMode::OwnerOnly,
+        );
     }
 
     if let Some(path) = systemd_credential_path(SYSTEMD_PASSPHRASE_CREDENTIAL) {
-        return read_passphrase_file(&path, "systemd credential secrets-passphrase");
+        return read_passphrase_file(
+            &path,
+            "systemd credential secrets-passphrase",
+            PassphraseFileMode::SystemdCredential,
+        );
     }
 
     if std::io::stdin().is_terminal() {
@@ -98,12 +106,22 @@ fn systemd_credential_path(name: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn read_passphrase_file(path: &Path, source: &str) -> Result<SecretString> {
+#[derive(Clone, Copy)]
+enum PassphraseFileMode {
+    OwnerOnly,
+    SystemdCredential,
+}
+
+fn read_passphrase_file(
+    path: &Path,
+    source: &str,
+    mode: PassphraseFileMode,
+) -> Result<SecretString> {
     use std::io::Read as _;
 
     // Open first, then validate the opened fd's metadata: the symlink and
     // permission checks cannot be raced against the read (no TOCTOU).
-    let mut file = open_passphrase_file(path)
+    let mut file = open_passphrase_file(path, mode)
         .with_context(|| format!("failed to open {source} passphrase file {}", path.display()))?;
 
     let mut passphrase = String::new();
@@ -119,7 +137,7 @@ fn read_passphrase_file(path: &Path, source: &str) -> Result<SecretString> {
 }
 
 #[cfg(unix)]
-fn open_passphrase_file(path: &Path) -> Result<fs::File> {
+fn open_passphrase_file(path: &Path, mode: PassphraseFileMode) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -133,15 +151,17 @@ fn open_passphrase_file(path: &Path) -> Result<fs::File> {
     if !meta.is_file() {
         bail!("passphrase file must be a regular file");
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
+    let file_mode = meta.permissions().mode();
+    // systemd LoadCredential may grant access through the service group; the
+    // staging directory is managed by systemd and already service-scoped.
+    if matches!(mode, PassphraseFileMode::OwnerOnly) && file_mode & 0o077 != 0 {
         bail!("passphrase file must not be readable, writable, or executable by group/others");
     }
     Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_passphrase_file(path: &Path) -> Result<fs::File> {
+fn open_passphrase_file(path: &Path, _mode: PassphraseFileMode) -> Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
         .open(path)
@@ -169,7 +189,8 @@ mod tests {
         fs::write(&path, "correct horse battery staple\r\n").unwrap();
         set_owner_only_permissions(&path);
 
-        let passphrase = read_passphrase_file(&path, "test").unwrap();
+        let passphrase =
+            read_passphrase_file(&path, "test", PassphraseFileMode::OwnerOnly).unwrap();
         assert_eq!(passphrase.expose_secret(), "correct horse battery staple");
     }
 
@@ -180,7 +201,8 @@ mod tests {
         fs::write(&path, "line1\nline2").unwrap();
         set_owner_only_permissions(&path);
 
-        let passphrase = read_passphrase_file(&path, "test").unwrap();
+        let passphrase =
+            read_passphrase_file(&path, "test", PassphraseFileMode::OwnerOnly).unwrap();
         assert_eq!(passphrase.expose_secret(), "line1\nline2");
     }
 
@@ -194,8 +216,23 @@ mod tests {
         fs::write(&path, "secret").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let err = read_passphrase_file(&path, "test").unwrap_err();
+        let err = read_passphrase_file(&path, "test", PassphraseFileMode::OwnerOnly).unwrap_err();
         assert!(format!("{err:#}").contains("group/others"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_credential_accepts_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("credential");
+        fs::write(&path, "secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
+
+        let passphrase =
+            read_passphrase_file(&path, "test", PassphraseFileMode::SystemdCredential).unwrap();
+        assert_eq!(passphrase.expose_secret(), "secret");
     }
 
     #[cfg(unix)]
