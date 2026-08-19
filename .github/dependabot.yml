@@ -11,6 +11,8 @@ updates:
           - "*"
     commit-message:
       prefix: "ci"
+    assignees:
+      - "darui3018823"
 
   # Keep Rust dependencies current.
   - package-ecosystem: "cargo"
@@ -25,3 +27,5 @@ updates:
           - "patch"
     commit-message:
       prefix: "deps"
+    assignees:
+      - "darui3018823"
