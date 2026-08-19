@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use secrecy::ExposeSecret;
 use secrets_crypto::{decrypt, encrypt, hash_token, MasterKey};
 use serde::{Deserialize, Serialize};
@@ -204,7 +204,7 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 
 fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
+    SysRng.try_fill_bytes(&mut key).expect("OS RNG failure");
     key
 }
 
@@ -359,7 +359,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
 
 fn random_temp_sibling(path: &Path) -> Result<PathBuf> {
     let mut suffix = [0u8; 16];
-    OsRng.fill_bytes(&mut suffix);
+    SysRng.try_fill_bytes(&mut suffix).expect("OS RNG failure");
     let file_name = path
         .file_name()
         .ok_or_else(|| Error::Cache(format!("invalid cache path {}", path.display())))?;

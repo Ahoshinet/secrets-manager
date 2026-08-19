@@ -20,8 +20,8 @@ use chacha20poly1305::{
     aead::{Aead, Key, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -158,7 +158,7 @@ pub fn encrypt(
     let cipher = XChaCha20Poly1305::new(cipher_key);
 
     let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng.try_fill_bytes(&mut nonce).expect("OS RNG failure");
 
     let nonce_ref: &XNonce = nonce
         .as_slice()
@@ -197,7 +197,7 @@ pub fn decrypt(
 /// Generate a fresh random salt (16 bytes) from the OS CSPRNG.
 pub fn generate_salt() -> [u8; 16] {
     let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
+    SysRng.try_fill_bytes(&mut salt).expect("OS RNG failure");
     salt
 }
 
@@ -219,7 +219,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// base64 (no padding). Shown to the operator exactly once.
 pub fn generate_token() -> SecretString {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    SysRng.try_fill_bytes(&mut raw).expect("OS RNG failure");
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     raw.zeroize();
     SecretString::from(encoded)
@@ -359,7 +359,7 @@ mod tests {
         let aad = aad_bytes("proj", "KEY");
         for i in 0..512u32 {
             let mut pt = [0u8; 32];
-            OsRng.fill_bytes(&mut pt);
+            SysRng.try_fill_bytes(&mut pt).expect("OS RNG failure");
             let (nonce, ct) = encrypt(&key, &pt, &aad).unwrap();
 
             let mut tampered = ct.clone();
@@ -407,8 +407,8 @@ mod tests {
         for _ in 0..256 {
             let mut a = [0u8; 16];
             let mut b = [0u8; 16];
-            OsRng.fill_bytes(&mut a);
-            OsRng.fill_bytes(&mut b);
+            SysRng.try_fill_bytes(&mut a).expect("OS RNG failure");
+            SysRng.try_fill_bytes(&mut b).expect("OS RNG failure");
             let aad = aad_bytes(&hex(&a), &hex(&b));
             let (nonce, ct) = encrypt(&key, b"x", &aad).unwrap();
 
